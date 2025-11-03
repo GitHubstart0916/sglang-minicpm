@@ -1144,6 +1144,7 @@ class ModelRunner:
     def forward_decode(
         self, forward_batch: ForwardBatch, pp_proxy_tensors=None
     ) -> LogitsProcessorOutput:
+        print("forward_decode")
         self.attn_backend.init_forward_metadata(forward_batch)
         # FIXME: add pp_proxy_tensors arg to all models
         kwargs = {}
@@ -1159,6 +1160,7 @@ class ModelRunner:
         skip_attn_backend_init: bool = False,
         pp_proxy_tensors=None,
     ) -> LogitsProcessorOutput:
+        print("forward_extend")
         if not skip_attn_backend_init:
             self.attn_backend.init_forward_metadata(forward_batch)
 
