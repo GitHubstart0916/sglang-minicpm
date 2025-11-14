@@ -709,7 +709,7 @@ class Scheduler(
                 )
             elif batch is None:
                 # When the server is idle, do self-check and re-init some states
-                self.check_memory()
+                # self.check_memory()
                 self.new_token_ratio = self.init_new_token_ratio
 
             self.last_batch = batch
@@ -1471,6 +1471,7 @@ class Scheduler(
             self.log_prefill_stats(adder, can_run_list, running_bs)
 
         # Create a new batch
+        print("get_new_batch_prefill")
         new_batch = ScheduleBatch.init_new(
             can_run_list,
             self.req_to_token_pool,
@@ -1545,6 +1546,9 @@ class Scheduler(
         self, batch: ScheduleBatch
     ) -> Union[GenerationBatchResult, EmbeddingBatchResult]:
         """Run a batch."""
+        
+        print("schedler.py::run_batch()")
+        
         self.forward_ct += 1
 
         # Whether to run the profiler

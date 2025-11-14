@@ -98,6 +98,7 @@ class RadixAttention(nn.Module):
             else:
                 k = k.view(-1, self.tp_k_head_num, self.v_head_dim)
 
+        # print(type(forward_batch.attn_backend).__name__)
         return forward_batch.attn_backend.forward(
             q,
             k,

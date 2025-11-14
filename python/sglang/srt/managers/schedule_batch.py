@@ -1118,6 +1118,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         ), f"Expected {len(self.out_cache_loc)}, got {self.extend_num_tokens}"
 
     def prepare_for_extend(self):
+        print("prepare_for_extend")
         self.forward_mode = ForwardMode.EXTEND
 
         # Allocate req slots
@@ -1226,8 +1227,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         else:
             extend_input_logprob_token_ids = None
 
+        # print(input_ids_tensor)
+        print("before alloc self.token_to_kv_pool_allocator.available_size()=", self.token_to_kv_pool_allocator.available_size())
         # Allocate memory
         if self.token_to_kv_pool_allocator.page_size == 1:
+            # if input_ids_tensor.shape[0] != 3:
+            sparse_loc = self.alloc_token_slots(extend_num_tokens)
             out_cache_loc = self.alloc_token_slots(extend_num_tokens)
         else:
             last_loc = get_last_loc(
@@ -1238,7 +1243,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             out_cache_loc = self.alloc_paged_token_slots_extend(
                 prefix_lens_tensor, seq_lens_tensor, last_loc, extend_num_tokens
             )
-
+        
+        print("after alloc self.token_to_kv_pool_allocator.available_size()=", self.token_to_kv_pool_allocator.available_size())
+        print("prepare_for_extend, out_cache_loc: ", out_cache_loc)
         # Set fields
         self.input_ids = input_ids_tensor
         self.req_pool_indices = req_pool_indices_tensor
@@ -1271,6 +1278,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.extend_lens = extend_lens
         self.extend_input_logprob_token_ids = extend_input_logprob_token_ids
 
+        # print("__FILE__ schedule_batch.py {}".format(support_triton(global_server_args_dict.get("attention_backend"))))
         # Write to req_to_token_pool
         if support_triton(global_server_args_dict.get("attention_backend")):
             # TODO: some tensors can be reused for ForwardBatchInfo (e.g., extend_lens, cumsum_start)
@@ -1301,6 +1309,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             self,
             self.model_config.vocab_size,
         )
+        
+        
+        print("end func self.token_to_kv_pool_allocator.available_size()=", self.token_to_kv_pool_allocator.available_size())
 
     def mix_with_running(self, running_batch: "ScheduleBatch"):
         self.forward_mode = ForwardMode.MIXED
@@ -1468,6 +1479,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     def prepare_for_decode(self):
         self.forward_mode = ForwardMode.DECODE
+        
+        print("prepare_for_decode")
         bs = len(self.reqs)
 
         if self.spec_algorithm.is_eagle():

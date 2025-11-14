@@ -188,6 +188,7 @@ class TpModelWorker:
     ) -> Tuple[
         Union[LogitsProcessorOutput, torch.Tensor], Optional[torch.Tensor], bool
     ]:
+        print("forward_batch_generation")
         forward_batch = ForwardBatch.init_new(model_worker_batch, self.model_runner)
 
         pp_proxy_tensors = None
