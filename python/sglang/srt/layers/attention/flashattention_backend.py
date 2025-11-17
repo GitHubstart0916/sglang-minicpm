@@ -695,6 +695,22 @@ class FlashAttentionBackend(AttentionBackend):
             max_seqlen_q = metadata.max_seq_len_q
             max_seqlen_k = metadata.max_seq_len_k
             cu_seqlens_k = metadata.cu_seqlens_k
+        
+        if layer.layer_id == 0:
+            print("self.use_mla {}, use_local_attn {}, use_cascade_attn {}, k_descale {}, v_descale {}, kv_cache_type {}, memory_saver_adapter {}".
+                  format(self.use_mla, use_local_attn, 
+                         use_cascade_attn, k_descale, v_descale,
+                         type(forward_batch.token_to_kv_pool).__name__,
+                         forward_batch.token_to_kv_pool.memory_saver_adapter))
+            print("page_table ", page_table)
+            print("page size ", self.page_size)
+            key_cache, value_cache = forward_batch.token_to_kv_pool.get_kv_buffer(
+                layer.layer_id
+            )
+            key_cache = key_cache.view(
+                -1, self.page_size, layer.tp_k_head_num, layer.head_dim
+            )
+            print("first page tensor", key_cache.shape, key_cache[page_table[0][0]], key_cache[page_table[0][0]].shape)
 
         # Use Flash Attention for prefill
         if not self.use_mla:
