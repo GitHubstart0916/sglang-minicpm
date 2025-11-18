@@ -151,6 +151,9 @@ class ForwardBatch:
     seq_lens: torch.Tensor
     # The indices of output tokens in the token_to_kv_pool
     out_cache_loc: torch.Tensor
+    # sparse related compressed cache loc
+    sparse_16_loc: torch.Tensor
+    sparse_64_loc: torch.Tensor
 
     # The sum of all sequence lengths
     seq_lens_sum: int
@@ -279,6 +282,8 @@ class ForwardBatch:
             req_pool_indices=batch.req_pool_indices,
             seq_lens=batch.seq_lens,
             out_cache_loc=batch.out_cache_loc,
+            sparse_16_loc=batch.sparse_16_loc,
+            sparse_64_loc=batch.sparse_64_loc,
             mm_inputs=batch.multimodal_inputs,
             encoder_cached=batch.encoder_cached,
             encoder_lens=batch.encoder_lens,

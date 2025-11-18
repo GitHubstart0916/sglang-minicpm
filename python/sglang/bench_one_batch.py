@@ -232,6 +232,7 @@ def prepare_synthetic_inputs_for_latency_test(batch_size, input_len):
 
 @torch.no_grad
 def extend(reqs, model_runner):
+    print("FILE bench_one_batch.py")
     batch = ScheduleBatch.init_new(
         reqs=reqs,
         req_to_token_pool=model_runner.req_to_token_pool,

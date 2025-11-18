@@ -144,7 +144,9 @@ class TpModelWorkerClient:
 
             # Resolve future tokens in the input
             input_ids = model_worker_batch.input_ids
+            print("dispatch, before resolve, input_ids is {}".format(input_ids))
             resolve_future_token_ids(input_ids, self.future_token_ids_map)
+            print("dispatch, after resolve, input_ids is {}".format(input_ids))
 
             # Run forward
             logits_output, next_token_ids, can_run_cuda_graph = (
@@ -207,6 +209,7 @@ class TpModelWorkerClient:
         self, model_worker_batch: ModelWorkerBatch
     ) -> Tuple[None, torch.Tensor, bool]:
         # Create a new copy of sampling_info because it will be updated in-place by the scheduler for the next batch.
+        print("forward_batch_generation with overlap")
         sampling_info = model_worker_batch.sampling_info
         sampling_info.update_penalties()
         model_worker_batch.sampling_info = self.cur_sampling_info = dataclasses.replace(
