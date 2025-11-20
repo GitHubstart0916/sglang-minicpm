@@ -475,11 +475,11 @@ class MiniCPMAttention(nn.Module):
         attn_output = self.attn(q, k, v, forward_batch)
         output, _ = self.o_proj(attn_output)
         
-        if self.layer_id == 0 and q.shape[0] == 8192:
-            attn_output_cpm = self._sparse_attn_forward(q.reshape(1, 8192, 32, 128), k.reshape(1, 8192, 2, 128), v.reshape(1, 8192, 2, 128), 8192)
-            attn_output_cpm = attn_output_cpm.reshape(8192, 4096)
+        if self.layer_id == 0 and q.shape[0] >= 8192:
+            attn_output_cpm = self._sparse_attn_forward(q.reshape(1, q.shape[0], 32, 128), k.reshape(1, q.shape[0], 2, 128), v.reshape(1, q.shape[0], 2, 128), q.shape[0])
+            attn_output_cpm = attn_output_cpm.reshape(q.shape[0], 4096)
             print(attn_output_cpm.shape)
-            attn_output_cpm.cpu().view(torch.uint16).numpy().tofile("attn_output_cpm.bin")
+            attn_output_cpm.cpu().view(torch.uint16).numpy().tofile("attn_output_cpm_{}.bin".format(q.shape[0]))
             
         if self.layer_id == 31:
             if forward_batch.sparse_16_loc is not None:
