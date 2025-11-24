@@ -112,6 +112,8 @@ class ReqToTokenPool:
             self.free_slots.append(free_index)
         else:
             self.free_slots.extend(free_index)
+        self.compress_k1_len[free_index] = 0
+        self.compress_k2_len[free_index] = 0
 
     def clear(self):
         self.free_slots = list(range(self.size))

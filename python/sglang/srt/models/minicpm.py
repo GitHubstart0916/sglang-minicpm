@@ -455,6 +455,7 @@ class MiniCPMAttention(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
+        # assert forward_batch.batch_size == 1, "Only batch size 1 is supported in MiniCPM for now."
         if self.layer_id == 0:
             print("Minicpm layer id {}, forward batch, batch_size {} seq_lens {}".format(self.layer_id, forward_batch.batch_size, forward_batch.seq_lens))
         qkv, _ = self.qkv_proj(hidden_states)
