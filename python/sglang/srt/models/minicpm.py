@@ -455,31 +455,33 @@ class MiniCPMAttention(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
+        if self.layer_id == 0:
+            print("Minicpm layer id {}, forward batch, batch_size {} seq_lens {}".format(self.layer_id, forward_batch.batch_size, forward_batch.seq_lens))
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         orig_dtype = q.dtype
         q, k = q.float(), k.float()
         q, k = self.rotary_emb(positions, q, k)
         q, k = q.to(orig_dtype), k.to(orig_dtype)
-        if self.layer_id == 0 and q.shape[0] == 8192:
-            print(q.shape, k.shape, v.shape)
-            print(q, k, v)
-        if self.layer_id == 0:
-            print("Minicpm batch {}, seq_len {}, cache_loc {}, sparse_16_loc {}, sparse_64_loc {}".
-                    format(forward_batch.batch_size, forward_batch.seq_lens, forward_batch.out_cache_loc, forward_batch.sparse_16_loc, forward_batch.sparse_64_loc))
-            print("Minicpm page_table {}, sparse_16_page_table {}, sparse_64_page_table {}".
-                    format(forward_batch.req_to_token_pool.req_to_token[forward_batch.req_pool_indices[0]][:forward_batch.seq_lens[0]],
-                           forward_batch.req_to_token_pool.req_to_sparse_16_token[forward_batch.req_pool_indices[0]][:self.compress_k1_len],
-                           forward_batch.req_to_token_pool.req_to_sparse_64_token[forward_batch.req_pool_indices[0]][:self.compress_k2_len]))
+        # if self.layer_id == 0 and q.shape[0] == 8192:
+        #     print(q.shape, k.shape, v.shape)
+        #     print(q, k, v)
+        # if self.layer_id == 0:
+        #     print("Minicpm batch {}, seq_len {}, cache_loc {}, sparse_16_loc {}, sparse_64_loc {}".
+        #             format(forward_batch.batch_size, forward_batch.seq_lens, forward_batch.out_cache_loc, forward_batch.sparse_16_loc, forward_batch.sparse_64_loc))
+        #     print("Minicpm page_table {}, sparse_16_page_table {}, sparse_64_page_table {}".
+        #             format(forward_batch.req_to_token_pool.req_to_token[forward_batch.req_pool_indices[0]][:forward_batch.seq_lens[0]],
+        #                    forward_batch.req_to_token_pool.req_to_sparse_16_token[forward_batch.req_pool_indices[0]][:self.compress_k1_len],
+        #                    forward_batch.req_to_token_pool.req_to_sparse_64_token[forward_batch.req_pool_indices[0]][:self.compress_k2_len]))
             
         attn_output = self.attn(q, k, v, forward_batch)
         output, _ = self.o_proj(attn_output)
         
-        if self.layer_id == 0 and q.shape[0] >= 8192:
-            attn_output_cpm = self._sparse_attn_forward(q.reshape(1, q.shape[0], 32, 128), k.reshape(1, q.shape[0], 2, 128), v.reshape(1, q.shape[0], 2, 128), q.shape[0])
-            attn_output_cpm = attn_output_cpm.reshape(q.shape[0], 4096)
-            print(attn_output_cpm.shape)
-            attn_output_cpm.cpu().view(torch.uint16).numpy().tofile("attn_output_cpm_{}.bin".format(q.shape[0]))
+        # if self.layer_id == 0 and q.shape[0] >= 8192:
+        #     attn_output_cpm = self._sparse_attn_forward(q.reshape(1, q.shape[0], 32, 128), k.reshape(1, q.shape[0], 2, 128), v.reshape(1, q.shape[0], 2, 128), q.shape[0])
+        #     attn_output_cpm = attn_output_cpm.reshape(q.shape[0], 4096)
+        #     print(attn_output_cpm.shape)
+        #     attn_output_cpm.cpu().view(torch.uint16).numpy().tofile("attn_output_cpm_{}.bin".format(q.shape[0]))
             
         if self.layer_id == 31:
             if forward_batch.sparse_16_loc is not None:
