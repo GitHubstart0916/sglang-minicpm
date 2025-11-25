@@ -839,6 +839,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # sparse related compressed cache loc
     sparse_16_loc: torch.Tensor = None # shape: [b], int64
     sparse_64_loc: torch.Tensor = None # shape: [b], int64
+    token_num_sparse_16_cpu: torch.Tensor = None # shape: [b], int64
+    token_num_sparse_64_cpu: torch.Tensor = None # shape: [b], int64
     
 
     # For multimodal inputs
@@ -1133,6 +1135,13 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         reqs = self.reqs
         input_ids = [r.fill_ids[len(r.prefix_indices) :] for r in reqs]
         extend_num_tokens = sum(len(ids) for ids in input_ids)
+        
+        # compressed kv cache loc per bs
+        token_num_sparse_16 = [(len(ids) - 32) // 16 + 1 for ids in input_ids]
+        token_sum_sparse_16 = sum(token_num_sparse_16)
+        token_num_sparse_64 = [(len(ids) - 128) // 64 + 1 for ids in input_ids]
+        token_sum_sparse_64 = sum(token_num_sparse_64)
+        
         seq_lens = [len(r.fill_ids) for r in reqs]
         prefix_lens = [len(r.prefix_indices) for r in reqs]
         extend_lens = [r.extend_input_len for r in reqs]
@@ -1238,9 +1247,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         if self.token_to_kv_pool_allocator.page_size == 1:
             # if input_ids_tensor.shape[0] != 3:
             if extend_num_tokens >= 32:
-                sparse_16_loc = self.alloc_token_slots(int((extend_num_tokens - 32) / 16) + 1)
+                sparse_16_loc = self.alloc_token_slots(token_sum_sparse_16)
             if extend_num_tokens >= 128:
-                sparse_64_loc = self.alloc_token_slots(int((extend_num_tokens - 128) / 64) + 1)
+                sparse_64_loc = self.alloc_token_slots(token_sum_sparse_64)
             out_cache_loc = self.alloc_token_slots(extend_num_tokens)
         else:
             last_loc = get_last_loc(
@@ -1260,6 +1269,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.seq_lens = seq_lens_tensor
         self.out_cache_loc = out_cache_loc
         self.sparse_16_loc = sparse_16_loc
+        self.token_num_sparse_16_cpu = torch.tensor(token_num_sparse_16, dtype=torch.int64)
+        self.token_num_sparse_64_cpu = torch.tensor(token_num_sparse_64, dtype=torch.int64)
         self.sparse_64_loc = sparse_64_loc
         
         self.input_embeds = (
@@ -1323,18 +1334,24 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         
         if self.sparse_16_loc is not None:
             # only support bs = 1
-            assert bs == 1
-            self.req_to_token_pool.write_sparse_16(
-                    (req_pool_indices[0], slice(0, int((extend_num_tokens - 32) / 16) + 1)),
-                    self.sparse_16_loc.to(torch.int32),
-            )
+            # assert bs == 1
+            pt = 0
+            for i in range(bs):
+                self.req_to_token_pool.write_sparse_16(
+                        (req_pool_indices[i], slice(0, token_num_sparse_16[i])),
+                        sparse_16_loc[pt : pt + token_num_sparse_16[i]].to(torch.int32),
+                )
+                pt += token_num_sparse_16[i]
         if self.sparse_64_loc is not None:
             # only support bs = 1
-            assert bs == 1
-            self.req_to_token_pool.write_sparse_64(
-                    (req_pool_indices[0], slice(0, int((extend_num_tokens - 128) / 64) + 1)),
-                    self.sparse_64_loc.to(torch.int32),
-            )
+            # assert bs == 1
+            pt = 0
+            for i in range(bs):
+                self.req_to_token_pool.write_sparse_64(
+                        (req_pool_indices[i], slice(0, token_num_sparse_64[i])),
+                        sparse_64_loc[pt : pt + token_num_sparse_64[i]].to(torch.int32),
+                )
+                pt += token_num_sparse_64[i]
         
         
         # print("end func self.token_to_kv_pool_allocator.available_size()=", self.token_to_kv_pool_allocator.available_size())
@@ -1510,6 +1527,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.forward_mode = ForwardMode.DECODE
         
         bs = len(self.reqs)
+        # if bs != 1:
+        #     return
         
         print("prepare_for_decode start")
 
@@ -1741,6 +1760,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             out_cache_loc=self.out_cache_loc,
             sparse_16_loc=self.sparse_16_loc,
             sparse_64_loc=self.sparse_64_loc,
+            token_num_sparse_16_cpu=self.token_num_sparse_16_cpu,
+            token_num_sparse_64_cpu=self.token_num_sparse_64_cpu,
             seq_lens_sum=self.seq_lens_sum,
             return_logprob=self.return_logprob,
             top_logprobs_nums=self.top_logprobs_nums,
@@ -1820,6 +1841,8 @@ class ModelWorkerBatch:
     # sparse related compressed cache loc
     sparse_16_loc: torch.Tensor
     sparse_64_loc: torch.Tensor
+    token_num_sparse_16_cpu: torch.Tensor
+    token_num_sparse_64_cpu: torch.Tensor
 
     # The sum of all sequence lengths
     seq_lens_sum: int

@@ -154,6 +154,8 @@ class ForwardBatch:
     # sparse related compressed cache loc
     sparse_16_loc: torch.Tensor
     sparse_64_loc: torch.Tensor
+    token_num_sparse_16_cpu: torch.Tensor
+    token_num_sparse_64_cpu: torch.Tensor
 
     # The sum of all sequence lengths
     seq_lens_sum: int
@@ -284,6 +286,8 @@ class ForwardBatch:
             out_cache_loc=batch.out_cache_loc,
             sparse_16_loc=batch.sparse_16_loc,
             sparse_64_loc=batch.sparse_64_loc,
+            token_num_sparse_16_cpu=batch.token_num_sparse_16_cpu,
+            token_num_sparse_64_cpu=batch.token_num_sparse_64_cpu,
             mm_inputs=batch.multimodal_inputs,
             encoder_cached=batch.encoder_cached,
             encoder_lens=batch.encoder_lens,
