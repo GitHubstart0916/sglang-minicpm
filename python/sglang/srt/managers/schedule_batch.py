@@ -1137,9 +1137,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         extend_num_tokens = sum(len(ids) for ids in input_ids)
         
         # compressed kv cache loc per bs
-        token_num_sparse_16 = [(len(ids) - 32) // 16 + 1 for ids in input_ids]
+        token_num_sparse_16 = [((len(ids) - 32) // 16 + 1 if len(ids) >= 32 else 0) for ids in input_ids]
         token_sum_sparse_16 = sum(token_num_sparse_16)
-        token_num_sparse_64 = [(len(ids) - 128) // 64 + 1 for ids in input_ids]
+        token_num_sparse_64 = [((len(ids) - 128) // 64 + 1  if len(ids) >= 128 else 0) for ids in input_ids]
         token_sum_sparse_64 = sum(token_num_sparse_64)
         
         seq_lens = [len(r.fill_ids) for r in reqs]
@@ -1337,21 +1337,23 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             # assert bs == 1
             pt = 0
             for i in range(bs):
-                self.req_to_token_pool.write_sparse_16(
-                        (req_pool_indices[i], slice(0, token_num_sparse_16[i])),
-                        sparse_16_loc[pt : pt + token_num_sparse_16[i]].to(torch.int32),
-                )
-                pt += token_num_sparse_16[i]
+                if token_num_sparse_16[i] > 0:
+                    self.req_to_token_pool.write_sparse_16(
+                            (req_pool_indices[i], slice(0, token_num_sparse_16[i])),
+                            sparse_16_loc[pt : pt + token_num_sparse_16[i]].to(torch.int32),
+                    )
+                    pt += token_num_sparse_16[i]
         if self.sparse_64_loc is not None:
             # only support bs = 1
             # assert bs == 1
             pt = 0
             for i in range(bs):
-                self.req_to_token_pool.write_sparse_64(
-                        (req_pool_indices[i], slice(0, token_num_sparse_64[i])),
-                        sparse_64_loc[pt : pt + token_num_sparse_64[i]].to(torch.int32),
-                )
-                pt += token_num_sparse_64[i]
+                if token_num_sparse_64[i] > 0:
+                    self.req_to_token_pool.write_sparse_64(
+                            (req_pool_indices[i], slice(0, token_num_sparse_64[i])),
+                            sparse_64_loc[pt : pt + token_num_sparse_64[i]].to(torch.int32),
+                    )
+                    pt += token_num_sparse_64[i]
         
         
         # print("end func self.token_to_kv_pool_allocator.available_size()=", self.token_to_kv_pool_allocator.available_size())
@@ -1530,7 +1532,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # if bs != 1:
         #     return
         
-        print("prepare_for_decode start")
+        print("prepare_for_decode start {}".format(self.spec_algorithm))
 
         if self.spec_algorithm.is_eagle():
             # if spec decoding is used, the decode batch is prepared inside
@@ -1597,29 +1599,70 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         )
         
         # fix this to something like use_sparse_attn
-        if bs == 1:
-            # sparse minicpm only support bs = 1
-            seq_len = self.seq_lens[0]
-            self.sparse_16_loc, self.sparse_64_loc = None, None
-            if seq_len >= 32 and (seq_len - 32) % 16 == 0:
-                self.sparse_16_loc = self.alloc_token_slots(1)
-            if seq_len >= 128 and (seq_len - 128) % 64 == 0:
-                self.sparse_64_loc = self.alloc_token_slots(1)
+        # if bs == 1:
+        
+        token_num_sparse_16 = [(1 if self.seq_lens[batch_idx] >= 32 and (self.seq_lens[batch_idx] - 32) % 16 == 0 else 0) for batch_idx in range(bs)]
+        token_sum_sparse_16 = sum(token_num_sparse_16)
+        token_num_sparse_64 = [(1 if self.seq_lens[batch_idx] >= 128 and (self.seq_lens[batch_idx] - 128) % 64 == 0 else 0) for batch_idx in range(bs)]
+        token_sum_sparse_64 = sum(token_num_sparse_64)
+        
+        sparse_16_loc, sparse_64_loc = None, None
+        if token_sum_sparse_16 > 0:
+            sparse_16_loc = self.alloc_token_slots(token_sum_sparse_16)
+            print("alloc sparse_16_loc {}, bs is {}, seq_lens is {}".format(self.sparse_16_loc, bs, self.seq_lens))
+        if token_sum_sparse_64 > 0:
+            sparse_64_loc = self.alloc_token_slots(token_sum_sparse_64)
+            print("alloc sparse_64_loc {}, bs is {}, seq_lens is {}".format(self.sparse_64_loc, bs, self.seq_lens))
+            
+        self.token_num_sparse_16_cpu = torch.tensor(token_num_sparse_16, dtype=torch.int64)
+        self.token_num_sparse_64_cpu = torch.tensor(token_num_sparse_64, dtype=torch.int64)
+        self.sparse_16_loc = sparse_16_loc
+        self.sparse_64_loc = sparse_64_loc
+        
+        if self.sparse_16_loc is not None:
+            pt = 0
+            for i in range(bs):
+                if token_num_sparse_16[i] > 0:
+                    self.req_to_token_pool.write_sparse_16(
+                            (self.req_pool_indices[i], (0, token_num_sparse_16[i])),
+                            self.sparse_16_loc[pt : pt + token_num_sparse_16[i]].to(torch.int32),
+                    )
+                    pt += token_num_sparse_16[i]
+        if self.sparse_64_loc is not None:
+            pt = 0
+            for i in range(bs):
+                if token_num_sparse_64[i] > 0:
+                    self.req_to_token_pool.write_sparse_64(
+                            (self.req_pool_indices[i], (0, token_num_sparse_64[i])),
+                            self.sparse_64_loc[pt : pt + token_num_sparse_64[i]].to(torch.int32),
+                    )
+                    pt += token_num_sparse_64[i]
+            
+        
+        
+        # if bs == 1:
+        #     # sparse minicpm only support bs = 1
+        #     seq_len = self.seq_lens[0]
+        #     self.sparse_16_loc, self.sparse_64_loc = None, None
+        #     if seq_len >= 32 and (seq_len - 32) % 16 == 0:
+        #         self.sparse_16_loc = self.alloc_token_slots(1)
+        #     if seq_len >= 128 and (seq_len - 128) % 64 == 0:
+        #         self.sparse_64_loc = self.alloc_token_slots(1)
                 
-            if self.sparse_16_loc is not None:
-                # only support bs = 1
-                assert bs == 1
-                self.req_to_token_pool.write_sparse_16(
-                        (self.req_pool_indices[0], int((seq_len - 32) / 16)),
-                        self.sparse_16_loc.to(torch.int32),
-                )
-            if self.sparse_64_loc is not None:
-                # only support bs = 1
-                assert bs == 1
-                self.req_to_token_pool.write_sparse_64(
-                        (self.req_pool_indices[0], int((seq_len - 128) / 64)),
-                        self.sparse_64_loc.to(torch.int32),
-                )
+        #     if self.sparse_16_loc is not None:
+        #         # only support bs = 1
+        #         assert bs == 1
+        #         self.req_to_token_pool.write_sparse_16(
+        #                 (self.req_pool_indices[0], int((seq_len - 32) / 16)),
+        #                 self.sparse_16_loc.to(torch.int32),
+        #         )
+        #     if self.sparse_64_loc is not None:
+        #         # only support bs = 1
+        #         assert bs == 1
+        #         self.req_to_token_pool.write_sparse_64(
+        #                 (self.req_pool_indices[0], int((seq_len - 128) / 64)),
+        #                 self.sparse_64_loc.to(torch.int32),
+        #         )
         
         print("prepare_for_decode, self.req_pool_indices {}, seq_lens {}, locs {}, out_cache_loc {}, sparse_16_loc {}, sparse_64_loc {}".
                         format(self.req_pool_indices, self.seq_lens, locs, self.out_cache_loc, self.sparse_16_loc, self.sparse_64_loc))

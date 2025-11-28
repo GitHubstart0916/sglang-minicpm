@@ -477,6 +477,9 @@ class MiniCPMAttention(nn.Module):
             
         attn_output = self.attn(q, k, v, forward_batch)
         output, _ = self.o_proj(attn_output)
+        if self.layer_id <= 1:
+            attn_output.cpu().view(torch.uint16).numpy().tofile("attn_output_{}_{}_layer_{}.bin".format(
+                q.shape[0], forward_batch.seq_lens_cpu[0], self.layer_id))
         
         # if self.layer_id == 0 and q.shape[0] >= 8192:
         #     attn_output_cpm = self._sparse_attn_forward(q.reshape(1, q.shape[0], 32, 128), k.reshape(1, q.shape[0], 2, 128), v.reshape(1, q.shape[0], 2, 128), q.shape[0])
