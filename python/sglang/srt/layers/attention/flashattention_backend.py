@@ -951,6 +951,7 @@ class FlashAttentionBackend(AttentionBackend):
         softmax_scale=None, 
         no_rope_param=None, 
         past_key_value=None,
+        decode_batch_id=0
     ):
         
         
@@ -1120,13 +1121,14 @@ class FlashAttentionBackend(AttentionBackend):
                 
             bs = query_states.shape[0]
             assert bs == 1
-            kv_len = forward_batch.seq_lens_cpu[0]
+            kv_len = forward_batch.seq_lens_cpu[decode_batch_id]
             attention_mask = torch.ones(bs, kv_len, dtype=torch.int64, device=query_states.device)
             compressed_k, compressed_cu_seqlens, compressed_k2, compressed_cu_seqlens2 = self._get_compress_k(
                 key_states=key_states,
                 attention_mask=attention_mask,
                 layer=layer,
-                forward_batch=forward_batch
+                forward_batch=forward_batch,
+                batch_id=decode_batch_id
             )
             # query_states, key_states, value_states, _, _, _ = self._upad_input(
             #     query_states, key_states, value_states, attention_mask, query_length
@@ -1283,8 +1285,8 @@ class FlashAttentionBackend(AttentionBackend):
         k2_compress_idx_st = 0 if past_compress_k2_token_num == 0 else (past_compress_k2_token_num - 1) * 64 + 64
         
         token_num = forward_batch.seq_lens_cpu[batch_id].item()
-        # print("Req id {}, past compress k1 token num {}, past compress k2 token num {}, current token num {}, k1_compress_idx_st {}, k2_compress_idx_st {}".format(
-        #     req_id, past_compress_k1_token_num, past_compress_k2_token_num, token_num, k1_compress_idx_st, k2_compress_idx_st
+        # print("forward mode is decode {} Req id {}, past compress k1 token num {}, past compress k2 token num {}, current token num {}, k1_compress_idx_st {}, k2_compress_idx_st {}".format(
+        #     forward_batch.forward_mode.is_decode(), req_id, past_compress_k1_token_num, past_compress_k2_token_num, token_num, k1_compress_idx_st, k2_compress_idx_st
         # ))
         
         key_cache,_ = forward_batch.token_to_kv_pool.get_kv_buffer(
@@ -1310,6 +1312,16 @@ class FlashAttentionBackend(AttentionBackend):
             seq_len = k1.shape[1]
             res_len = (seq_len - ((seq_len - 32) // 16 * 16 + 32)) + 16
             new_k1_num = (seq_len - 32) // 16 + 1
+            # print("sparse 16 loc len {}, sum token num sparse 16 cpu up to batch id {} is {} {}, write loc len is {}, compressed_k1 shape {}".format(
+            #     forward_batch.sparse_16_loc.shape,
+            #     batch_id,
+            #     torch.sum(forward_batch.token_num_sparse_16_cpu[:batch_id]),
+            #     torch.sum(forward_batch.token_num_sparse_16_cpu[:batch_id + 1]),
+            #     forward_batch.sparse_16_loc[
+            #         torch.sum(forward_batch.token_num_sparse_16_cpu[:batch_id]) 
+            #         : torch.sum(forward_batch.token_num_sparse_16_cpu[:batch_id + 1])].shape,
+            #     compressed_k1.shape
+            # ))
             forward_batch.token_to_kv_pool.set_kv_buffer(
                 layer, forward_batch.sparse_16_loc[
                     torch.sum(forward_batch.token_num_sparse_16_cpu[:batch_id]) 
@@ -2127,7 +2139,8 @@ class FlashAttentionBackend(AttentionBackend):
                                                     1, 
                                                     layer, 
                                                     forward_batch,
-                                                    False)
+                                                    False,
+                                                    decode_batch_id=b)
                         # if layer.layer_id == 0:
                         #     print("topk_idx shape {} page_table shape {}".format(topk_idx.shape, page_table.shape))
                         #     topk_idx.cpu().numpy().tofile("bs_{}_topk_idx_{}_{}_{}.bin".format(bs, forward_batch.seq_lens_cpu[b], layer.layer_id, b))
