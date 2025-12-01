@@ -1124,7 +1124,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         ), f"Expected {len(self.out_cache_loc)}, got {self.extend_num_tokens}"
 
     def prepare_for_extend(self):
-        print("prepare_for_extend start")
+        # print("prepare_for_extend start")
         self.forward_mode = ForwardMode.EXTEND
 
         # Allocate req slots
@@ -1358,8 +1358,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         
         # print("end func self.token_to_kv_pool_allocator.available_size()=", self.token_to_kv_pool_allocator.available_size())
         # print("prepare_for_extend end, inpout_id/output_id is {} {}".format(self.input_ids, self.output_ids))
-        print("prepare_for_extend, self.req_pool_indices {}, seq_lens {}, locs {}, out_cache_loc {}, sparse_16_loc {}, sparse_64_loc {}".
-              format(self.req_pool_indices, self.seq_lens, slice(prefix_lens[0], seq_lens[0]), self.out_cache_loc, self.sparse_16_loc, self.sparse_64_loc))
+        # print("prepare_for_extend, self.req_pool_indices {}, seq_lens {}, locs {}, out_cache_loc {}, sparse_16_loc {}, sparse_64_loc {}".
+        #       format(self.req_pool_indices, self.seq_lens, slice(prefix_lens[0], seq_lens[0]), self.out_cache_loc, self.sparse_16_loc, self.sparse_64_loc))
 
     def mix_with_running(self, running_batch: "ScheduleBatch"):
         self.forward_mode = ForwardMode.MIXED
@@ -1532,7 +1532,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # if bs != 1:
         #     return
         
-        print("prepare_for_decode start {}".format(self.spec_algorithm))
+        # print("prepare_for_decode start {}".format(self.spec_algorithm))
 
         if self.spec_algorithm.is_eagle():
             # if spec decoding is used, the decode batch is prepared inside
@@ -1609,10 +1609,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         sparse_16_loc, sparse_64_loc = None, None
         if token_sum_sparse_16 > 0:
             sparse_16_loc = self.alloc_token_slots(token_sum_sparse_16)
-            print("alloc sparse_16_loc {}, bs is {}, seq_lens is {}".format(self.sparse_16_loc, bs, self.seq_lens))
+            # print("alloc sparse_16_loc {}, bs is {}, seq_lens is {}".format(self.sparse_16_loc, bs, self.seq_lens))
         if token_sum_sparse_64 > 0:
             sparse_64_loc = self.alloc_token_slots(token_sum_sparse_64)
-            print("alloc sparse_64_loc {}, bs is {}, seq_lens is {}".format(self.sparse_64_loc, bs, self.seq_lens))
+            # print("alloc sparse_64_loc {}, bs is {}, seq_lens is {}".format(self.sparse_64_loc, bs, self.seq_lens))
             
         self.token_num_sparse_16_cpu = torch.tensor(token_num_sparse_16, dtype=torch.int64)
         self.token_num_sparse_64_cpu = torch.tensor(token_num_sparse_64, dtype=torch.int64)
@@ -1664,8 +1664,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         #                 self.sparse_64_loc.to(torch.int32),
         #         )
         
-        print("prepare_for_decode, self.req_pool_indices {}, seq_lens {}, locs {}, out_cache_loc {}, sparse_16_loc {}, sparse_64_loc {}".
-                        format(self.req_pool_indices, self.seq_lens, locs, self.out_cache_loc, self.sparse_16_loc, self.sparse_64_loc))
+        # print("prepare_for_decode, self.req_pool_indices {}, seq_lens {}, locs {}, out_cache_loc {}, sparse_16_loc {}, sparse_64_loc {}".
+        #                 format(self.req_pool_indices, self.seq_lens, locs, self.out_cache_loc, self.sparse_16_loc, self.sparse_64_loc))
 
     def filter_batch(
         self,

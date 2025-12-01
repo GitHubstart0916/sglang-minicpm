@@ -25,7 +25,7 @@ def set_default_torch_dtype(dtype: torch.dtype):
 
 
 def resolve_transformers_arch(model_config: ModelConfig, architectures: list[str]):
-    print(model_config, architectures)
+    # print(model_config, architectures)
     for i, arch in enumerate(architectures):
         if arch == "TransformersForCausalLM":
             continue

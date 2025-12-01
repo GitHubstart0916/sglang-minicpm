@@ -83,7 +83,7 @@ class ReqToTokenPool:
             self.compress_k1_len = torch.zeros((size), dtype=torch.int32, device="cpu")
             self.compress_k2_len = torch.zeros((size), dtype=torch.int32, device="cpu")
         
-        print("Init ReqToTokenPool (size, max_context_len is)=({},{})".format(size, max_context_len))
+        # print("Init ReqToTokenPool (size, max_context_len is)=({},{})".format(size, max_context_len))
         self.free_slots = list(range(size))
 
     def write(self, indices, values):
@@ -112,7 +112,7 @@ class ReqToTokenPool:
             self.free_slots.append(free_index)
         else:
             self.free_slots.extend(free_index)
-        print("Free ReqToTokenPool indices {}, compress_k1_len {}".format(free_index, self.compress_k1_len))
+        # print("Free ReqToTokenPool indices {}, compress_k1_len {}".format(free_index, self.compress_k1_len))
         self.compress_k1_len[free_index] = 0
         self.compress_k2_len[free_index] = 0
 

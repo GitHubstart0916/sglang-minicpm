@@ -1445,7 +1445,9 @@ class FlashAttentionBackend(AttentionBackend):
         q_rope: Optional[torch.Tensor] = None,
         k_rope: Optional[torch.Tensor] = None,
     ):
-        
+        import cProfile
+        pr = cProfile.Profile()
+        pr.enable()  
         # if layer.layer_id == 0 and q.shape[0] == 17:
         #     q.cpu().view(torch.uint16).numpy().tofile("1_attn_query_{}_{}.bin".format(q.shape[0], layer.layer_id))
         #     k.cpu().view(torch.uint16).numpy().tofile("1_attn_key_cache_{}_{}.bin".format(q.shape[0], layer.layer_id))
@@ -1688,8 +1690,8 @@ class FlashAttentionBackend(AttentionBackend):
         key_cache, value_cache = forward_batch.token_to_kv_pool.get_kv_buffer(
             layer.layer_id
         )
-        if layer.layer_id == 0 and q.shape[0] == 3:
-            print(key_cache[3])
+        # if layer.layer_id == 0 and q.shape[0] == 3:
+        #     print(key_cache[3])
         
         key_cache = key_cache.view(
             -1, self.page_size, layer.tp_k_head_num // 2, layer.head_dim
@@ -1755,6 +1757,9 @@ class FlashAttentionBackend(AttentionBackend):
         #     result.cpu().view(torch.uint16).numpy().tofile("attn_output_{}_{}.bin".format(q.shape[0], layer.layer_id))
         
         attn_output = result.reshape(q.shape[0], 4096)
+        
+        pr.disable()
+        pr.dump_stats("profiler_stats_extend_layer_{}.prof".format(layer.layer_id))
         return attn_output
 
         # Use Flash Attention for prefill
@@ -3309,7 +3314,7 @@ class FlashAttentionMultiStepBackend:
         self.model_runner = model_runner
         self.topk = topk
         self.speculative_num_steps = speculative_num_steps
-        print("init fa backend, speculative_num_steps is {}".format(speculative_num_steps))
+        # print("init fa backend, speculative_num_steps is {}".format(speculative_num_steps))
         self.attn_backends = []
         for i in range(self.speculative_num_steps):
             self.attn_backends.append(

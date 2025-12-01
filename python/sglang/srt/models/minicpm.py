@@ -456,8 +456,8 @@ class MiniCPMAttention(nn.Module):
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
         # assert forward_batch.batch_size == 1, "Only batch size 1 is supported in MiniCPM for now."
-        if self.layer_id == 0:
-            print("Minicpm layer id {}, forward batch, batch_size {} seq_lens {}".format(self.layer_id, forward_batch.batch_size, forward_batch.seq_lens))
+        # if self.layer_id == 0:
+        #     print("Minicpm layer id {}, forward batch, batch_size {} seq_lens {}".format(self.layer_id, forward_batch.batch_size, forward_batch.seq_lens))
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         orig_dtype = q.dtype
@@ -513,10 +513,10 @@ class MiniCPMAttention(nn.Module):
         # q, k, v shape is [batched_seq_len, hidden_dim]
         # assert batch_size == 1, 'Only batch_size=1 is supported at the moment.'
         attention_mask = torch.ones(query_states.shape[0], query_states.shape[1], dtype=torch.int64, device=query_states.device)
-        if self.layer_id == 0:
-            print("use_nope: {}".format(self.use_nope))
-            print(key_states.shape, attention_mask.shape)
-            print(key_states, attention_mask)
+        # if self.layer_id == 0:
+        #     print("use_nope: {}".format(self.use_nope))
+        #     print(key_states.shape, attention_mask.shape)
+        #     print(key_states, attention_mask)
             
         compressed_k, compressed_cu_seqlens, compressed_k2, compressed_cu_seqlens2 = self._get_compress_k(
             key_states=key_states,
@@ -524,17 +524,17 @@ class MiniCPMAttention(nn.Module):
             past_key_value=past_key_value,   
         )
         
-        if self.layer_id == 0:
-            print(compressed_k.shape, compressed_cu_seqlens.shape, compressed_k2.shape, compressed_cu_seqlens2.shape)
-            print(compressed_k, compressed_cu_seqlens, compressed_k2, compressed_cu_seqlens2)
+        # if self.layer_id == 0:
+        #     print(compressed_k.shape, compressed_cu_seqlens.shape, compressed_k2.shape, compressed_cu_seqlens2.shape)
+        #     print(compressed_k, compressed_cu_seqlens, compressed_k2, compressed_cu_seqlens2)
          
         query_states, key_states, value_states, indices_q, cu_seq_lens, max_seq_lens = self._upad_input(
                     query_states, key_states, value_states, attention_mask, query_length
                 )
         
-        if self.layer_id == 0:
-            print("line: 1198", query_states.shape, key_states.shape, value_states.shape, indices_q.shape)
-            print("line: 1199", query_states, key_states, value_states, indices_q, cu_seq_lens, max_seq_lens)
+        # if self.layer_id == 0:
+        #     print("line: 1198", query_states.shape, key_states.shape, value_states.shape, indices_q.shape)
+        #     print("line: 1199", query_states, key_states, value_states, indices_q, cu_seq_lens, max_seq_lens)
         cu_seqlens_q, cu_seqlens_k = cu_seq_lens
         max_seqlen_in_batch_q, max_seqlen_in_batch_k = max_seq_lens   
         
@@ -592,9 +592,9 @@ class MiniCPMAttention(nn.Module):
             cache_lens=cache_lens
         )
         
-        if self.layer_id == 0:
-            print(topk_idx.shape)
-            print(topk_idx)
+        # if self.layer_id == 0:
+        #     print(topk_idx.shape)
+        #     print(topk_idx)
             
         topk_attn_output = infllmv2_attn_varlen_func(
             query_layer,
