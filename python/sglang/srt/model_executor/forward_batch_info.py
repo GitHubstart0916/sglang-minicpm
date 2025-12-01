@@ -262,6 +262,32 @@ class ForwardBatch:
     tbo_split_seq_index: Optional[int] = None
     tbo_parent_token_range: Optional[Tuple[int, int]] = None
     tbo_children: Optional[List["ForwardBatch"]] = None
+    
+    # For MiniCPM Sparse
+    sparse_page_table_bs: int = 0
+    sparse_bs_list: Optional[List[int]] = None
+    sparse_page_table_max_len: int = 0
+    old_bs_to_new_bs_range: Optional[List[int]] = None
+    sparse_max_seqlen_q: int = 0
+    sparse_bs_num: int = 0
+    sparse_page_table: Optional[torch.Tensor] = None
+    sparse_cu_seqlens_q_cpu: Optional[torch.Tensor] = None
+    
+    seqlen_q_sparse_bs: Optional[List[int]] = None
+    seqlen_q_sparse_bs_tensor: Optional[torch.Tensor] = None
+    cu_seqlens_q_sparse_bs: Optional[torch.Tensor] = None
+    q_shape_sparse_bs: Optional[int] = None
+    token_to_bs: Optional[torch.Tensor] = None
+    token_pos_in_bs: Optional[torch.Tensor] = None
+    sparse_idx: Optional[List[int]] = None
+    
+    sparse_cache_lens: Optional[torch.Tensor] = None
+    sparse_cu_seqlens_q: Optional[torch.Tensor] = None
+    sparse_cu_seqlens_kv: Optional[torch.Tensor] = None
+    
+    # decode
+    sparse_cache_seqlens_cpu: Optional[torch.Tensor] = None
+    sparse_cache_seqlens: Optional[torch.Tensor] = None
 
     @classmethod
     def init_new(
@@ -385,6 +411,75 @@ class ForwardBatch:
             model_runner.lora_manager.prepare_lora_batch(ret)
 
         TboForwardBatchPreparer.prepare(ret)
+        
+        # prepare sparse related info
+        # bs = ret.batch_size
+        # ret.sparse_page_table_bs = 0
+        # ret.sparse_bs_list = []
+        # ret.sparse_page_table_max_len = -1
+        # # [0, 2, 4, 100] mean that, after trans, bs is 100
+        # # old_bs[0] -> new_bs[0,1]
+        # # old_bs[1] -> new_bs[2,3]
+        # # old_bs[2] -> new_bs[4 : 100]
+        # ret.old_bs_to_new_bs_range = [0 for _ in range(bs + 1)]
+        # ret.sparse_max_seqlen_q = 1 # since we treat sparse prefill as multi-batch decode
+        # for i in range(bs):
+        #     if ret.extend_seq_lens_cpu[i] >= 8192:
+        #         ret.sparse_page_table_max_len = max(ret.sparse_page_table_max_len, 6144)
+        #         ret.sparse_bs_list.append(i)
+        #         ret.sparse_page_table_bs += ret.extend_seq_lens_cpu[i] * 2 # each head_group as a batch
+        #         ret.old_bs_to_new_bs_range[i + 1] = ret.old_bs_to_new_bs_range[i] + 2 * ret.extend_seq_lens_cpu[i]
+        #     else:
+        #         ret.sparse_page_table_max_len = max(ret.sparse_page_table_max_len, ret.extend_seq_lens_cpu[i])
+        #         ret.sparse_page_table_bs += 2 # each head_group as a batch
+        #         ret.old_bs_to_new_bs_range[i + 1] = ret.old_bs_to_new_bs_range[i] + 2
+        #         ret.sparse_max_seqlen_q = max(ret.sparse_max_seqlen_q, ret.extend_seq_lens_cpu[i])
+        
+        # ret.sparse_bs_num = len(ret.sparse_bs_list)
+        # ret.sparse_page_table = torch.zeros((ret.sparse_page_table_bs, ret.sparse_page_table_max_len), 
+        #                                     dtype=ret.req_to_token_pool.req_to_token.dtype, 
+        #                                     device=ret.req_to_token_pool.req_to_token.device)
+        # ret.sparse_cu_seqlens_q_cpu = torch.zeros((ret.sparse_page_table_bs + 1), 
+        #                                           dtype=torch.int32, device='cpu')
+        # pt = 0
+        # for i in range(bs):
+        #     if ret.extend_seq_lens_cpu[i] >= 8192:
+        #         for _ in range(ret.extend_seq_lens_cpu[i] * 2):
+        #             ret.sparse_cu_seqlens_q_cpu[pt + 1] = ret.sparse_cu_seqlens_q_cpu[pt] + 1 
+        #             pt += 1
+        #     else:
+        #         for _ in range(2):
+        #             ret.sparse_cu_seqlens_q_cpu[pt + 1] = ret.sparse_cu_seqlens_q_cpu[pt] + ret.extend_seq_lens_cpu[i]
+        #             pt += 1
+        # assert pt == ret.sparse_page_table_bs, "sparse_page_table_bs {} vs pt {}".format(ret.sparse_page_table_bs, pt)
+
+        # ret.seqlen_q_sparse_bs = ret.extend_seq_lens[ret.sparse_bs_list].tolist()
+        # ret.sparse_q_sparse_bs_tensor = torch.tensor(ret.seqlen_q_sparse_bs, 
+        #                                              dtype=torch.int32, 
+        #                                              device=ret.extend_seq_lens.device)
+        
+        
+        # ret.cu_seqlens_q_sparse_bs = torch.tensor([0] + ret.seqlen_q_sparse_bs, 
+        #                                             dtype=torch.int32, device='cpu').cumsum(dtype=torch.int32, dim=0)
+        # ret.q_shape_sparse_bs = ret.cu_seqlens_q_sparse_bs[-1].item()
+        
+        
+        
+        # ret.token_to_bs = torch.zeros(ret.q_shape_sparse_bs, dtype=torch.int32, device='cpu')
+        # for i in range(ret.sparse_bs_num):
+        #     ret.token_to_bs[ret.cu_seqlens_q_sparse_bs[i] : ret.cu_seqlens_q_sparse_bs[i + 1]] = i
+        
+        
+        # ret.token_pos_in_bs = torch.zeros(ret.q_shape_sparse_bs, dtype=torch.int32, device='cpu')
+        # for i in range(ret.sparse_bs_num):
+        #     ret.token_pos_in_bs[ret.cu_seqlens_q_sparse_bs[i] : ret.cu_seqlens_q_sparse_bs[i + 1]] = torch.tensor(
+        #         [(idx + 1) for idx in range(ret.seqlen_q_sparse_bs[i])], dtype=ret.token_to_bs.dtype, device=ret.token_to_bs.device)
+        
+        # ret.sparse_idx = []
+        # for sparse_bs in ret.sparse_bs_list:
+        #     ret.sparse_idx.extend(range(ret.old_bs_to_new_bs_range[sparse_bs] , ret.old_bs_to_new_bs_range[sparse_bs + 1]))
+               
+          
 
         return ret
 
