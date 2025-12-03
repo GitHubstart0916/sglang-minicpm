@@ -1471,7 +1471,7 @@ class Scheduler(
             self.log_prefill_stats(adder, can_run_list, running_bs)
 
         # Create a new batch
-        print("get_new_batch_prefill")
+        # print("get_new_batch_prefill")
         new_batch = ScheduleBatch.init_new(
             can_run_list,
             self.req_to_token_pool,
@@ -1547,7 +1547,7 @@ class Scheduler(
     ) -> Union[GenerationBatchResult, EmbeddingBatchResult]:
         """Run a batch."""
         
-        print("schedler.py::run_batch() self.is_generation={}, self.spec_algorithm.is_none()={}".format(self.is_generation, self.spec_algorithm.is_none()))
+        # print("schedler.py::run_batch() self.is_generation={}, self.spec_algorithm.is_none()={}".format(self.is_generation, self.spec_algorithm.is_none()))
         
         self.forward_ct += 1
 
@@ -1561,7 +1561,7 @@ class Scheduler(
         if self.is_generation:
             if self.spec_algorithm.is_none():
                 model_worker_batch = batch.get_model_worker_batch()
-                print("Success get model_worker_batch from schedulerBatch")
+                # print("Success get model_worker_batch from schedulerBatch")
                 if self.pp_group.is_last_rank:
                     logits_output, next_token_ids, can_run_cuda_graph = (
                         self.tp_worker.forward_batch_generation(model_worker_batch)
