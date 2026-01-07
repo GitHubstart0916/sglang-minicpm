@@ -151,14 +151,16 @@ class ForwardBatch:
     seq_lens: torch.Tensor
     # The indices of output tokens in the token_to_kv_pool
     out_cache_loc: torch.Tensor
-    # sparse related compressed cache loc
-    sparse_16_loc: torch.Tensor
-    sparse_64_loc: torch.Tensor
-    token_num_sparse_16_cpu: torch.Tensor
-    token_num_sparse_64_cpu: torch.Tensor
+
 
     # The sum of all sequence lengths
     seq_lens_sum: int
+    
+    # sparse related compressed cache loc
+    sparse_16_loc: torch.Tensor = None
+    sparse_64_loc: torch.Tensor = None
+    token_num_sparse_16_cpu: torch.Tensor = None
+    token_num_sparse_64_cpu: torch.Tensor = None
 
     # Optional seq_lens on cpu
     seq_lens_cpu: Optional[torch.Tensor] = None

@@ -240,6 +240,9 @@ class CudaGraphRunner:
                 (self.max_bs,), self.seq_len_fill_value, dtype=torch.int32
             )
             self.out_cache_loc = torch.zeros((self.max_num_token,), dtype=torch.int64)
+            self.sparse_16_loc = torch.zeros((self.max_num_token // 16,), dtype=torch.int64)
+            self.sparse_64_loc = torch.zeros((self.max_num_token // 64,), dtype=torch.int64)
+
             self.positions = torch.zeros((self.max_num_token,), dtype=torch.int64)
             self.mrope_positions = torch.zeros((3, self.max_bs), dtype=torch.int64)
             self.num_token_non_padded = torch.zeros((1,), dtype=torch.int32)
@@ -470,6 +473,7 @@ class CudaGraphRunner:
             lora_paths=lora_paths,
             num_token_non_padded=self.num_token_non_padded,
             global_forward_mode=self.capture_forward_mode,
+            seq_lens_cpu=seq_lens.cpu(),
         )
         self.tbo_plugin.capture_one_batch_size(forward_batch, num_tokens=num_tokens)
 
