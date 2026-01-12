@@ -285,7 +285,7 @@ class ForwardBatch:
     
     sparse_cache_lens: Optional[torch.Tensor] = None
     sparse_cu_seqlens_q: Optional[torch.Tensor] = None
-    sparse_cu_seqlens_kv: Optional[torch.Tensor] = None
+    sparse_cu_seqlens_k: Optional[torch.Tensor] = None
     
     # decode
     sparse_cache_seqlens_cpu: Optional[torch.Tensor] = None
