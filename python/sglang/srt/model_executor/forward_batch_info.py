@@ -407,30 +407,17 @@ class ForwardBatch:
     return_hidden_states_before_norm: bool = False
 
     # For MiniCPM Sparse
-    sparse_page_table_bs: int = 0
-    sparse_bs_list: Optional[List[int]] = None
-    sparse_page_table_max_len: int = 0
-    old_bs_to_new_bs_range: Optional[List[int]] = None
-    sparse_max_seqlen_q: int = 0
-    sparse_bs_num: int = 0
+    sparse_batch_size: int = 0
     sparse_page_table: Optional[torch.Tensor] = None
-    sparse_cu_seqlens_q_cpu: Optional[torch.Tensor] = None
 
-    seqlen_q_sparse_bs: Optional[List[int]] = None
-    seqlen_q_sparse_bs_tensor: Optional[torch.Tensor] = None
-    cu_seqlens_q_sparse_bs: Optional[torch.Tensor] = None
-    q_shape_sparse_bs: Optional[int] = None
-    token_to_bs: Optional[torch.Tensor] = None
-    token_pos_in_bs: Optional[torch.Tensor] = None
+    # Record the original positions of sparse requests to run dense 
+    # and sparse requests simultaneously
     sparse_idx: Optional[List[int]] = None
 
     sparse_cache_lens: Optional[torch.Tensor] = None
-    sparse_cu_seqlens_q: Optional[torch.Tensor] = None
-    sparse_cu_seqlens_kv: Optional[torch.Tensor] = None
 
-    # decode
+    # decode, only used in decode
     sparse_cache_seqlens_cpu: Optional[torch.Tensor] = None
-    sparse_cache_seqlens: Optional[torch.Tensor] = None
 
     @classmethod
     def init_new(
