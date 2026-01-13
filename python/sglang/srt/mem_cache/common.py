@@ -79,16 +79,16 @@ def write_req_to_token_pool_triton(
 
 def write_cache_indices(
     out_cache_loc: torch.Tensor,
-    sparse_16_loc: torch.Tensor,
-    sparse_64_loc: torch.Tensor,
+    sparse_k1_loc: torch.Tensor,
+    sparse_k2_loc: torch.Tensor,
     req_pool_indices_tensor: torch.Tensor,
     req_pool_indices_cpu: torch.Tensor,
     prefix_lens_tensor: torch.Tensor,
     prefix_lens_cpu: torch.Tensor,
     seq_lens_tensor: torch.Tensor,
     seq_lens_cpu: torch.Tensor,
-    token_num_sparse_16_cpu: torch.Tensor,
-    token_num_sparse_64_cpu: torch.Tensor,
+    token_num_sparse_k1_cpu: torch.Tensor,
+    token_num_sparse_k2_cpu: torch.Tensor,
     extend_lens_tensor: torch.Tensor,
     extend_lens_cpu: torch.Tensor,
     prefix_tensors: list[torch.Tensor],
@@ -130,24 +130,24 @@ def write_cache_indices(
             pt += extend_len
 
     bs = req_pool_indices_cpu.shape[0]
-    if sparse_16_loc is not None:
+    if sparse_k1_loc is not None:
         pt = 0
         for i in range(bs):
-            if token_num_sparse_16_cpu[i] > 0:
-                req_to_token_pool.write_sparse_16(
-                        (req_pool_indices_cpu[i].item(), slice(0, token_num_sparse_16_cpu[i])),
-                        sparse_16_loc[pt : pt + token_num_sparse_16_cpu[i]].to(torch.int32),
+            if token_num_sparse_k1_cpu[i] > 0:
+                req_to_token_pool.write_sparse_k1(
+                        (req_pool_indices_cpu[i].item(), slice(0, token_num_sparse_k1_cpu[i])),
+                        sparse_k1_loc[pt : pt + token_num_sparse_k1_cpu[i]].to(torch.int32),
                 )
-                pt += token_num_sparse_16_cpu[i]
-    if sparse_64_loc is not None:
+                pt += token_num_sparse_k1_cpu[i]
+    if sparse_k2_loc is not None:
         pt = 0
         for i in range(bs):
-            if token_num_sparse_64_cpu[i] > 0:
-                req_to_token_pool.write_sparse_64(
-                        (req_pool_indices_cpu[i], slice(0, token_num_sparse_64_cpu[i])),
-                        sparse_64_loc[pt : pt + token_num_sparse_64_cpu[i]].to(torch.int32),
+            if token_num_sparse_k2_cpu[i] > 0:
+                req_to_token_pool.write_sparse_k2(
+                        (req_pool_indices_cpu[i], slice(0, token_num_sparse_k2_cpu[i])),
+                        sparse_k2_loc[pt : pt + token_num_sparse_k2_cpu[i]].to(torch.int32),
                 )
-                pt += token_num_sparse_64_cpu[i]
+                pt += token_num_sparse_k2_cpu[i]
 
 def get_last_loc(
     req_to_token: torch.Tensor,
@@ -393,12 +393,12 @@ def alloc_for_extend(
     req_pool_indices_device = req_pool_indices_cpu.to(batch.device, non_blocking=True)
 
     # Allocate KV cache (throws exception on failure)
-    sparse_16_loc, sparse_64_loc = None, None
+    sparse_k1_loc, sparse_k2_loc = None, None
     if batch.tree_cache.page_size == 1:
-        if batch.extend_num_tokens >= 32:
-            sparse_16_loc = alloc_token_slots(batch.tree_cache, batch.token_sum_sparse_16)
-        if batch.extend_num_tokens >= 128:
-            sparse_64_loc = alloc_token_slots(batch.tree_cache, batch.token_sum_sparse_64)
+        if batch.extend_num_tokens >= batch.req_to_token_pool.kernel_size:
+            sparse_k1_loc = alloc_token_slots(batch.tree_cache, batch.token_sum_sparse_k1)
+        if batch.extend_num_tokens >= batch.req_to_token_pool.kernel_size * 4:
+            sparse_k2_loc = alloc_token_slots(batch.tree_cache, batch.token_sum_sparse_k2)
         out_cache_loc = alloc_token_slots(batch.tree_cache, batch.extend_num_tokens)
     else:
         # Paged allocation - build last_loc
@@ -419,23 +419,23 @@ def alloc_for_extend(
     # Write to req_to_token_pool
     write_cache_indices(
         out_cache_loc,
-        sparse_16_loc,
-        sparse_64_loc,
+        sparse_k1_loc,
+        sparse_k2_loc,
         req_pool_indices_device,
         req_pool_indices_cpu,
         prefix_lens_device,
         prefix_lens_cpu,
         batch.seq_lens,
         batch.seq_lens_cpu,
-        batch.token_num_sparse_16_cpu,
-        batch.token_num_sparse_64_cpu,
+        batch.token_num_sparse_k1_cpu,
+        batch.token_num_sparse_k2_cpu,
         extend_lens_device,
         extend_lens_cpu,
         prefix_tensors,
         batch.req_to_token_pool,
     )
 
-    return out_cache_loc, sparse_16_loc, sparse_64_loc, req_pool_indices_device, req_pool_indices
+    return out_cache_loc, sparse_k1_loc, sparse_k2_loc, req_pool_indices_device, req_pool_indices
 
 
 def alloc_paged_token_slots_decode(
@@ -484,16 +484,16 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
 
     bs = batch.seq_lens.shape[0]
 
-    sparse_16_loc, sparse_64_loc = None, None
+    sparse_k1_loc, sparse_k2_loc = None, None
     if batch.tree_cache.page_size == 1:
         # Non-paged allocation
         out_cache_loc = alloc_token_slots(batch.tree_cache, bs * token_per_req)
-        if batch.token_sum_sparse_16 > 0:
-            sparse_16_loc = alloc_token_slots(batch.tree_cache, batch.token_sum_sparse_16)
-            # print("alloc sparse_16_loc {}, bs is {}, seq_lens is {}".format(self.sparse_16_loc, bs, self.seq_lens))
-        if batch.token_sum_sparse_64 > 0:
-            sparse_64_loc = alloc_token_slots(batch.tree_cache, batch.token_sum_sparse_64)
-            # print("alloc sparse_64_loc {}, bs is {}, seq_lens is {}".format(self.sparse_64_loc, bs, self.seq_lens))
+        if batch.token_sum_sparse_k1 > 0:
+            sparse_k1_loc = alloc_token_slots(batch.tree_cache, batch.token_sum_sparse_k1)
+            # print("alloc sparse_k1_loc {}, bs is {}, seq_lens is {}".format(self.sparse_k1_loc, bs, self.seq_lens))
+        if batch.token_sum_sparse_k2 > 0:
+            sparse_k2_loc = alloc_token_slots(batch.tree_cache, batch.token_sum_sparse_k2)
+            # print("alloc sparse_k2_loc {}, bs is {}, seq_lens is {}".format(self.sparse_k2_loc, bs, self.seq_lens))
     else:
         # Paged allocation
         last_loc = batch.req_to_token_pool.req_to_token[
@@ -518,27 +518,26 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
         (batch.req_pool_indices, locs), out_cache_loc.to(torch.int32)
     )
 
-    if sparse_16_loc is not None:
+    if sparse_k1_loc is not None:
         pt = 0
         for i in range(bs):
-            if batch.token_num_sparse_16_cpu[i] > 0:
-                batch.req_to_token_pool.write_sparse_16(
-                    (batch.req_pool_indices[i], (0, batch.token_num_sparse_16_cpu[i])),
-                    sparse_16_loc[pt : pt + batch.token_num_sparse_16_cpu[i]].to(torch.int32),
+            if batch.token_num_sparse_k1_cpu[i] > 0:
+                batch.req_to_token_pool.write_sparse_k1(
+                    (batch.req_pool_indices[i], (0, batch.token_num_sparse_k1_cpu[i])),
+                    sparse_k1_loc[pt : pt + batch.token_num_sparse_k1_cpu[i]].to(torch.int32),
                 )
-                pt += batch.token_num_sparse_16_cpu[i]
-    if sparse_64_loc is not None:
+                pt += batch.token_num_sparse_k1_cpu[i]
+    if sparse_k2_loc is not None:
         pt = 0
         for i in range(bs):
-            if batch.token_num_sparse_64_cpu[i] > 0:
-                batch.req_to_token_pool.write_sparse_64(
-                    (batch.req_pool_indices[i], (0, batch.token_num_sparse_64_cpu[i])),
-                    sparse_64_loc[pt : pt + batch.token_num_sparse_64_cpu[i]].to(torch.int32),
+            if batch.token_num_sparse_k2_cpu[i] > 0:
+                batch.req_to_token_pool.write_sparse_k2(
+                    (batch.req_pool_indices[i], (0, batch.token_num_sparse_k2_cpu[i])),
+                    sparse_k2_loc[pt : pt + batch.token_num_sparse_k2_cpu[i]].to(torch.int32),
                 )
-                pt += batch.token_num_sparse_64_cpu[i]
+                pt += batch.token_num_sparse_k2_cpu[i]
 
-    return out_cache_loc, sparse_16_loc, sparse_64_loc
-
+    return out_cache_loc, sparse_k1_loc, sparse_k2_loc
 
 def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = True):
     tree_cache.cache_finished_req(req, is_insert=is_insert)

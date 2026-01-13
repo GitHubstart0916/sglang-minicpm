@@ -9,6 +9,7 @@ import torch
 
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, MatchResult
 from sglang.srt.mem_cache.swa_memory_pool import SWATokenToKVPoolAllocator
+from sglang.srt.mem_cache.memory_pool import MiniCPMReqToTokenPool
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -55,6 +56,15 @@ class ChunkCache(BasePrefixCache):
         ]
         self.req_to_token_pool.free(req.req_pool_idx)
         self.token_to_kv_pool_allocator.free(kv_indices)
+        if isinstance(self.req_to_token_pool, MiniCPMReqToTokenPool):
+            k1_committed_len = (kv_committed_len - self.req_to_token_pool.kernel_size) // self.req_to_token_pool.kernel_stride + 1 if kv_committed_len >= self.req_to_token_pool.kernel_size else 0
+            if k1_committed_len > 0:
+                k1_indices = self.req_to_token_pool.req_to_sparse_k1_token[req.req_pool_idx, :k1_committed_len]
+                self.token_to_kv_pool_allocator.free(k1_indices)
+            k2_committed_len = (kv_committed_len - self.req_to_token_pool.kernel_size * 4) // (self.req_to_token_pool.kernel_stride * 4) + 1 if kv_committed_len >= self.req_to_token_pool.kernel_size * 4 else 0
+            if k2_committed_len > 0:
+                k2_indices = self.req_to_token_pool.req_to_sparse_k2_token[req.req_pool_idx, :k2_committed_len]
+                self.token_to_kv_pool_allocator.free(k2_indices)
 
     def cache_unfinished_req(self, req: Req, chunked=False):
         kv_indices = self.req_to_token_pool.req_to_token[

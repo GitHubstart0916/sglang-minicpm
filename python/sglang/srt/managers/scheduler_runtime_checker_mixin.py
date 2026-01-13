@@ -327,7 +327,7 @@ class SchedulerRuntimeCheckerMixin:
             if queue_size:
                 return
 
-        # self.check_memory()
+        self.check_memory()
         self.check_tree_cache()
         self.new_token_ratio = self.init_new_token_ratio
         self.maybe_sleep_on_idle()

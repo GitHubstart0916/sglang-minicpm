@@ -97,27 +97,11 @@ class ReqToTokenPool:
             self.req_to_token = torch.zeros(
                 (size, max_context_len), dtype=torch.int32, device=device
             )
-            self.req_to_sparse_16_token = torch.zeros(
-                (size, int((max_context_len - 32) / 16) + 1), dtype=torch.int32, device=device
-            )
-            self.req_to_sparse_64_token = torch.zeros(
-                (size, int((max_context_len - 128) / 64) + 1), dtype=torch.int32, device=device
-            )
-        # no compressed k cache for now, size is less than 
-        # (32 + 128) (which is compress kernel size) * head_num * head_dim for each req
-        self.compress_k1_len = torch.zeros((size), dtype=torch.int32, device="cpu")
-        self.compress_k2_len = torch.zeros((size), dtype=torch.int32, device="cpu")
 
         self.free_slots = list(range(size))
 
     def write(self, indices, values):
         self.req_to_token[indices] = values
-
-    def write_sparse_16(self, indices, values):
-        self.req_to_sparse_16_token[indices] = values
-
-    def write_sparse_64(self, indices, values):
-        self.req_to_sparse_64_token[indices] = values
 
     def available_size(self):
         return len(self.free_slots)
@@ -136,9 +120,7 @@ class ReqToTokenPool:
             self.free_slots.append(free_index)
         else:
             self.free_slots.extend(free_index)
-        self.compress_k1_len[free_index] = 0
-        self.compress_k2_len[free_index] = 0
-        
+
     def clear(self):
         self.free_slots = list(range(self.size))
 
@@ -520,6 +502,43 @@ class HybridReqToTokenPool(ReqToTokenPool):
         if self.enable_mamba_extra_buffer:
             self.req_index_to_mamba_ping_pong_track_buffer_mapping.zero_()
 
+class MiniCPMReqToTokenPool(ReqToTokenPool):
+    """A memory pool that maps a request to its token locations."""
+
+    def __init__(
+        self,
+        size: int,
+        max_context_len: int,
+        device: str,
+        enable_memory_saver: bool,
+        kernel_size: int,
+        kernel_stride: int,
+    ):
+        super().__init__(
+            size=size,
+            max_context_len=max_context_len,
+            device=device,
+            enable_memory_saver=enable_memory_saver,
+        )
+        self.kernel_size = kernel_size
+        self.kernel_stride = kernel_stride
+        memory_saver_adapter = TorchMemorySaverAdapter.create(
+            enable=enable_memory_saver
+        )
+
+        with memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
+            self.req_to_sparse_k1_token = torch.zeros(
+                (size, int((max_context_len - kernel_size) / kernel_stride) + 1), dtype=torch.int32, device=device
+            )
+            self.req_to_sparse_k2_token = torch.zeros(
+                (size, int((max_context_len - kernel_size * 4) / (kernel_stride * 4)) + 1), dtype=torch.int32, device=device
+            )
+
+    def write_sparse_k1(self, indices, values):
+        self.req_to_sparse_k1_token[indices] = values
+
+    def write_sparse_k2(self, indices, values):
+        self.req_to_sparse_k2_token[indices] = values
 
 class KVCache(abc.ABC):
     @abc.abstractmethod

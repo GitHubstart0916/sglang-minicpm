@@ -163,15 +163,7 @@ class MiniCPMAttention(nn.Module):
         q, k = q.to(orig_dtype), k.to(orig_dtype)
         attn_output = self.attn(q, k, v, forward_batch)
         output, _ = self.o_proj(attn_output)
-
-        if self.layer_id == 31:
-            for i in range(forward_batch.batch_size):
-                req_id = forward_batch.req_pool_indices[i]
-                if forward_batch.sparse_16_loc is not None:
-                    forward_batch.req_to_token_pool.compress_k1_len[req_id] += forward_batch.token_num_sparse_16_cpu[i]
-                if forward_batch.sparse_64_loc is not None:
-                    forward_batch.req_to_token_pool.compress_k2_len[req_id] += forward_batch.token_num_sparse_64_cpu[i]
-
+        
         return output
 
 

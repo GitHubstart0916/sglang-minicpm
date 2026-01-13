@@ -360,7 +360,6 @@ def compressed_attention(
             stride=kernel_stride
         )  # shape: [num_heads, total_q_len, num_blocks]
 
-
         # get topk
         topk = min(topk, block_score.shape[-1])
         topk_idx = block_score.topk(topk, dim=-1).indices.sort(-1).values
@@ -457,23 +456,24 @@ class FlashAttentionBackend(AttentionBackend):
             1 if model_runner.server_args.enable_deterministic_inference else 0
         )
 
-        # compress args
-        self.kernel_size = 32
-        self.kernel_stride = 16
-        self.init_blocks = 1
-        self.block_size = 64
-        self.window_size = 2048
-        self.dense_len = 8192
+        # minicpm args
+        self.is_sparse_minicpm = model_runner.model_config.minicpm_sparse_config is not None
+        if self.is_sparse_minicpm:
+            minicpm_sparse_config = model_runner.model_config.minicpm_sparse_config
+            self.kernel_size = minicpm_sparse_config.kernel_size
+            self.kernel_stride = minicpm_sparse_config.kernel_stride
+            self.init_blocks = minicpm_sparse_config.init_blocks
+            self.block_size = minicpm_sparse_config.block_size
+            self.window_size = minicpm_sparse_config.window_size
+            self.dense_len = minicpm_sparse_config.dense_len
+            topk = minicpm_sparse_config.topk
+            self.use_nope = minicpm_sparse_config.use_nope
+            self.local_blocks = self.window_size // self.block_size  # local_blocks
+            self.sparse_topk = topk + (self.window_size // self.block_size)
+            self.num_sparse_topk_tokens = self.block_size * self.sparse_topk
 
-        self.local_blocks = self.window_size // self.block_size  # local_blocks
-        self.sparse_topk = 64 + (self.window_size // self.block_size)
-        self.use_nope = False
-
-        self.compress_k1_len = 0
-        self.compress_k2_len = 0
-
-        self.compress_k = CompressK(2, 128, kernel_size=self.kernel_size, kernel_stride=self.kernel_stride)
-        self.compress_k2 = CompressK(2, 128, kernel_size=self.kernel_size*4, kernel_stride=self.kernel_stride*4)
+            self.compress_k = CompressK(2, 128, kernel_size=self.kernel_size, kernel_stride=self.kernel_stride)
+            self.compress_k2 = CompressK(2, 128, kernel_size=self.kernel_size*4, kernel_stride=self.kernel_stride*4)
 
     def update_batch_for_sparse(self, forward_batch: ForwardBatch, metadata: FlashAttentionMetadata):
         if forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed():
@@ -491,7 +491,7 @@ class FlashAttentionBackend(AttentionBackend):
 
             for i in range(bs):
                 if forward_batch.extend_seq_lens_cpu[i] >= self.dense_len:
-                    forward_batch.sparse_page_table_max_len = max(forward_batch.sparse_page_table_max_len, 6144)
+                    forward_batch.sparse_page_table_max_len = max(forward_batch.sparse_page_table_max_len, self.num_sparse_topk_tokens)
                     forward_batch.sparse_bs_list.append(i)
                     forward_batch.sparse_page_table_bs += forward_batch.extend_seq_lens_cpu[i] * 2 # each head_group as a batch
                     forward_batch.old_bs_to_new_bs_range[i + 1] = forward_batch.old_bs_to_new_bs_range[i] + 2 * forward_batch.extend_seq_lens_cpu[i]
@@ -544,12 +544,12 @@ class FlashAttentionBackend(AttentionBackend):
             for b in range(bs):
                 # print("forward_batch.seq_lens_cpu[{}] {}".format(b, forward_batch.seq_lens_cpu[b]))
                 if forward_batch.seq_lens_cpu[b] >= self.dense_len:
-                    sparse_len = 6144 if cache_seqlens[b] % 64 == 0 else 64 * 95 + (cache_seqlens[b] % 64)
+                    sparse_len = self.num_sparse_topk_tokens if cache_seqlens[b] % self.block_size == 0 else self.block_size * (self.sparse_topk - 1) + (cache_seqlens[b] % self.block_size)
                     if sparse_len > max_sparse_cache_len:
                         max_sparse_cache_len = sparse_len
 
-                    forward_batch.sparse_cache_seqlens_cpu[2 * b] = 6144 if cache_seqlens[b] % 64 == 0 else 64 * 95 + (cache_seqlens[b] % 64)
-                    forward_batch.sparse_cache_seqlens_cpu[2 * b + 1] = 6144 if cache_seqlens[b] % 64 == 0 else 64 * 95 + (cache_seqlens[b] % 64)
+                    forward_batch.sparse_cache_seqlens_cpu[2 * b] = sparse_len
+                    forward_batch.sparse_cache_seqlens_cpu[2 * b + 1] = sparse_len
                 else:
                     if cache_seqlens[b] > max_sparse_cache_len:
                         max_sparse_cache_len = cache_seqlens[b]
@@ -894,7 +894,8 @@ class FlashAttentionBackend(AttentionBackend):
                 )
                 self.forward_metadata_spec_decode_expand.page_table = expand_page_table
 
-        self.update_batch_for_sparse(forward_batch, metadata)
+        if self.is_sparse_minicpm:
+            self.update_batch_for_sparse(forward_batch, metadata)
 
         self.forward_metadata = metadata
 
@@ -915,10 +916,10 @@ class FlashAttentionBackend(AttentionBackend):
         decode_batch_id=0
     ):
         if is_prefill:
-            bs, seqlens_q, seqlens_k, k1_lens, k2_lens = forward_batch.batch_size, forward_batch.extend_seq_lens_cpu, forward_batch.extend_seq_lens_cpu, forward_batch.token_num_sparse_16_cpu, forward_batch.token_num_sparse_64_cpu
+            bs, seqlens_q, seqlens_k, k1_lens, k2_lens = forward_batch.batch_size, forward_batch.extend_seq_lens_cpu, forward_batch.extend_seq_lens_cpu, forward_batch.token_num_sparse_k1_cpu, forward_batch.token_num_sparse_k2_cpu
             pt, pt_k1, pt_k2 = 0, 0, 0
-            compressed_k = torch.zeros((sum(forward_batch.token_num_sparse_16_cpu), layer.tp_k_head_num, layer.head_dim), dtype=key_states.dtype, device=key_states.device)
-            compressed_k2 = torch.zeros((sum(forward_batch.token_num_sparse_64_cpu), layer.tp_k_head_num, layer.head_dim), dtype=key_states.dtype, device=key_states.device)
+            compressed_k = torch.zeros((sum(forward_batch.token_num_sparse_k1_cpu), layer.tp_k_head_num, layer.head_dim), dtype=key_states.dtype, device=key_states.device)
+            compressed_k2 = torch.zeros((sum(forward_batch.token_num_sparse_k2_cpu), layer.tp_k_head_num, layer.head_dim), dtype=key_states.dtype, device=key_states.device)
 
             compressed_cu_seqlens, compressed_cu_seqlens2 = [0], [0]
 
@@ -1210,7 +1211,7 @@ class FlashAttentionBackend(AttentionBackend):
                 forward_batch.token_to_bs.to(topk_idx.device),
                 forward_batch.token_pos_in_bs.to(topk_idx.device),
                 forward_batch.sparse_q_sparse_bs_tensor.to(topk_idx.device)
-            ).reshape(-1, 6144)
+            ).reshape(-1, self.num_sparse_topk_tokens)
 
             # page_table shape []
             # sparse_page_table = torch.zeros
@@ -1694,7 +1695,7 @@ class FlashAttentionBackend(AttentionBackend):
                             forward_batch.token_to_bs.to(topk_idx.device),
                             cache_seqlens[b:b+1].to(topk_idx.device),
                             cache_seqlens[b:b+1].to(topk_idx.device)
-                        ).reshape(-1, 6144)
+                        ).reshape(-1, self.num_sparse_topk_tokens)
 
                         forward_batch.sparse_page_table_sparse_bs[2 * b : 2 * b + 2, :forward_batch.sparse_cache_seqlens_cpu[2 * b]] = ret[:, :forward_batch.sparse_cache_seqlens_cpu[2 * b]]
                     else:

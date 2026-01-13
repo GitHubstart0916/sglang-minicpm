@@ -34,6 +34,7 @@ from sglang.srt.utils.hf_transformers_utils import (
     get_sparse_attention_config,
 )
 from sglang.utils import is_in_ci
+from sglang.srt.configs.minicpm import MiniCPMSparseConfig
 
 logger = logging.getLogger(__name__)
 
@@ -64,7 +65,6 @@ def is_deepseek_nsa(config: PretrainedConfig) -> bool:
         and getattr(config, "index_topk", None) is not None
     )
 
-
 def get_nsa_index_head_dim(config: PretrainedConfig) -> int:
     assert is_deepseek_nsa(config)
     return config.index_head_dim
@@ -79,6 +79,12 @@ def get_nsa_index_n_heads(config: PretrainedConfig) -> int:
     assert is_deepseek_nsa(config)
     return config.index_n_heads
 
+def is_minicpm_sparse(config: PretrainedConfig) -> bool:
+    return (
+        config.architectures is not None
+        and config.architectures[0] == "MiniCPMForCausalLM"
+        and getattr(config, "sparse_config", None) is not None
+    )
 
 class ModelConfig:
     def __init__(
@@ -127,6 +133,7 @@ class ModelConfig:
             model_override_args=self.model_override_args,
             **kwargs,
         )
+        self.minicpm_sparse_config = MiniCPMSparseConfig.from_hf_config(self.hf_config) if is_minicpm_sparse(self.hf_config) else None
         self.hf_text_config = get_hf_text_config(self.hf_config)
         self.hf_generation_config = get_generation_config(
             self.model_path,

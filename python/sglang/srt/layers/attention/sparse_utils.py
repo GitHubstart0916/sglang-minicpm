@@ -247,11 +247,16 @@ def get_compress_k(key_states, attention_mask,
                     batch_id = 0):
     # only support batch size 1 for now
     req_id = forward_batch.req_pool_indices[batch_id]
-    past_compress_k1_token_num = forward_batch.req_to_token_pool.compress_k1_len[req_id]
-    past_compress_k2_token_num = forward_batch.req_to_token_pool.compress_k2_len[req_id]
 
-    k1_compress_idx_st = 0 if past_compress_k1_token_num == 0 else (past_compress_k1_token_num - 1) * 16 + 16
-    k2_compress_idx_st = 0 if past_compress_k2_token_num == 0 else (past_compress_k2_token_num - 1) * 64 + 64
+    if forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed():
+        past_token_num = forward_batch.extend_prefix_lens_cpu[batch_id]
+    else: # decode
+        past_token_num = forward_batch.seq_lens_cpu[batch_id] - 1
+    past_compress_k1_token_num = (past_token_num - compress_k.kernel_size) // compress_k.kernel_stride + 1 if past_token_num >= compress_k.kernel_size else 0
+    past_compress_k2_token_num = (past_token_num - compress_k2.kernel_size) // compress_k2.kernel_stride + 1 if past_token_num >= compress_k2.kernel_size else 0
+
+    k1_compress_idx_st = 0 if past_compress_k1_token_num == 0 else (past_compress_k1_token_num - 1) * compress_k.kernel_stride + compress_k.kernel_stride
+    k2_compress_idx_st = 0 if past_compress_k2_token_num == 0 else (past_compress_k2_token_num - 1) * compress_k2.kernel_stride + compress_k2.kernel_stride
 
     token_num = forward_batch.seq_lens_cpu[batch_id].item()
 
@@ -271,44 +276,42 @@ def get_compress_k(key_states, attention_mask,
 
     new_k1_num, new_k2_num = 0, 0
 
-    if k1.shape[1] >= 32:
+    if k1.shape[1] >= compress_k.kernel_size:
         attention_mask = torch.ones(k1.shape[0], k1.shape[1], dtype=torch.int64, device=k1.device)
         unpadded_key_states, _, cu_seqlens, _ = _unpad_one_tensor(k1,attention_mask=attention_mask)
         compressed_k1, compressed_cu_seqlens = compress_k(unpadded_key_states, cu_seqlens)
         seq_len = k1.shape[1]
-        res_len = (seq_len - ((seq_len - 32) // 16 * 16 + 32)) + 16
-        new_k1_num = (seq_len - 32) // 16 + 1
+        new_k1_num = (seq_len - compress_k.kernel_size) // compress_k.kernel_stride + 1
 
         forward_batch.token_to_kv_pool.set_kv_buffer(
-            layer, forward_batch.sparse_16_loc[
-                torch.sum(forward_batch.token_num_sparse_16_cpu[:batch_id]) 
-                : torch.sum(forward_batch.token_num_sparse_16_cpu[:batch_id + 1])], 
+            layer, forward_batch.sparse_k1_loc[
+                torch.sum(forward_batch.token_num_sparse_k1_cpu[:batch_id]) 
+                : torch.sum(forward_batch.token_num_sparse_k1_cpu[:batch_id + 1])], 
             compressed_k1, compressed_k1, None, None
         )
 
-    if k2.shape[1] >= 128:
+    if k2.shape[1] >= compress_k2.kernel_size:
         attention_mask = torch.ones(k2.shape[0], k2.shape[1], dtype=torch.int64, device=k2.device)
         unpadded_key_states, _, cu_seqlens, _ = _unpad_one_tensor(k2,attention_mask=attention_mask)
         compressed_k2, compressed_cu_seqlens2 = compress_k2(unpadded_key_states, cu_seqlens)
         seq_len = k2.shape[1]
-        res_len2 = (seq_len - ((seq_len - 128) // 64 * 64 + 128)) + 64
-        new_k2_num = (seq_len - 128) // 64 + 1
+        new_k2_num = (seq_len - compress_k2.kernel_size) // compress_k2.kernel_stride + 1
         forward_batch.token_to_kv_pool.set_kv_buffer(
-            layer, forward_batch.sparse_64_loc[torch.sum(forward_batch.token_num_sparse_64_cpu[:batch_id]) 
-                : torch.sum(forward_batch.token_num_sparse_64_cpu[:batch_id + 1])], 
+            layer, forward_batch.sparse_k2_loc[torch.sum(forward_batch.token_num_sparse_k2_cpu[:batch_id]) 
+                : torch.sum(forward_batch.token_num_sparse_k2_cpu[:batch_id + 1])], 
             compressed_k2, compressed_k2, None, None
         )
 
     compressed_k1, _ = forward_batch.token_to_kv_pool.get_kv_buffer(
             layer.layer_id
     )
-    compressed_k1 = compressed_k1[forward_batch.req_to_token_pool.req_to_sparse_16_token[forward_batch.req_pool_indices[batch_id]][:forward_batch.req_to_token_pool.compress_k1_len[req_id] + new_k1_num]]
+    compressed_k1 = compressed_k1[forward_batch.req_to_token_pool.req_to_sparse_k1_token[forward_batch.req_pool_indices[batch_id]][:past_compress_k1_token_num + new_k1_num]]
     compressed_cu_seqlens = torch.tensor([0, compressed_k1.shape[0]], device=compressed_k1.device, dtype=torch.int32)
 
     compressed_k2, _ = forward_batch.token_to_kv_pool.get_kv_buffer(
             layer.layer_id
     )
-    compressed_k2 = compressed_k2[forward_batch.req_to_token_pool.req_to_sparse_64_token[forward_batch.req_pool_indices[batch_id]][:forward_batch.req_to_token_pool.compress_k2_len[req_id] + new_k2_num]]
+    compressed_k2 = compressed_k2[forward_batch.req_to_token_pool.req_to_sparse_k2_token[forward_batch.req_pool_indices[batch_id]][:past_compress_k2_token_num + new_k2_num]]
     compressed_cu_seqlens2 = torch.tensor([0, compressed_k2.shape[0]], device=compressed_k2.device, dtype=torch.int32)
 
     return compressed_k1, compressed_cu_seqlens, compressed_k2, compressed_cu_seqlens2
