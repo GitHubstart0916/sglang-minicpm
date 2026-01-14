@@ -425,6 +425,8 @@ class FlashAttentionBackend(AttentionBackend):
         self.forward_metadata_spec_decode_expand: FlashAttentionMetadata = None
         self.max_context_len = model_runner.model_config.context_len
         self.device = model_runner.device
+        self.enable_cuda_graph = not get_global_server_args().disable_cuda_graph
+        # print("FlashAttentionBackend enable_cuda_graph: {}".format(self.enable_cuda_graph))
         self.decode_cuda_graph_metadata = {}
         self.target_verify_metadata = {}
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
@@ -491,28 +493,14 @@ class FlashAttentionBackend(AttentionBackend):
 
             self.compress_k1 = CompressK(2, 128, kernel_size=self.kernel_size, kernel_stride=self.kernel_stride)
             self.compress_k2 = CompressK(2, 128, kernel_size=self.kernel_size*4, kernel_stride=self.kernel_stride*4)
-        # compress args
-        self.kernel_size = 32
-        self.kernel_stride = 16
-        self.init_blocks = 1
-        self.block_size = 64
-        self.window_size = 2048
-        self.dense_len = 8192
-
-        self.local_blocks = self.window_size // self.block_size  # local_blocks
-        self.sparse_topk = 64 + (self.window_size // self.block_size)
-        self.use_nope = False
-
-        self.compress_k = CompressK(2, 128, kernel_size=self.kernel_size, kernel_stride=self.kernel_stride)
-        self.compress_k2 = CompressK(2, 128, kernel_size=self.kernel_size*4, kernel_stride=self.kernel_stride*4)
-        
-        # TODO: sync with sparse config 
-        self.head_group_num = 2 # k_head_num
-        self.k1_kernel_size = 32
-        self.k1_kernel_stride = 16
-        
-        self.k2_kernel_size = 32 * 4
-        self.k2_kernel_stride = 16 * 4
+     
+            # TODO: sync with sparse config 
+            self.head_group_num = 2 # k_head_num
+            self.k1_kernel_size = self.kernel_size
+            self.k1_kernel_stride = self.kernel_stride
+            
+            self.k2_kernel_size = self.kernel_size * 4
+            self.k2_kernel_stride = self.kernel_stride * 4
 
     def update_batch_for_sparse(self, forward_batch: ForwardBatch, metadata: FlashAttentionMetadata):
         if forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed():
@@ -1279,7 +1267,7 @@ class FlashAttentionBackend(AttentionBackend):
 
         q_reshaped = q.contiguous().view(-1, layer.tp_q_head_num // 2, layer.head_dim)
         if forward_batch.sparse_batch_size < bs:
-            assert forward_batch.sparse_batch_size == 0, "bs must be all dense or all sparse for cuda graph support"
+            assert not self.enable_cuda_graph or forward_batch.sparse_batch_size == 0, "bs must be all dense or all sparse for cuda graph support"
 
         forward_batch.sparse_cache_lens = (forward_batch.sparse_page_table != 0).sum(dim=1).to(dtype=cache_seqlens.dtype, device=cache_seqlens.device)
 
@@ -1321,7 +1309,7 @@ class FlashAttentionBackend(AttentionBackend):
         )
 
         if forward_batch.sparse_batch_size < bs:
-            assert forward_batch.sparse_batch_size == 0, "bs must be all dense or all sparse for cuda graph support"
+            assert not self.enable_cuda_graph or forward_batch.sparse_batch_size == 0, "bs must be all dense or all sparse for cuda graph support"
 
         attn_output = result.reshape(q.shape[0], layer.tp_q_head_num * layer.head_dim)
         return attn_output
