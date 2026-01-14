@@ -520,19 +520,27 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
 
     if sparse_k1_loc is not None:
         pt = 0
+        k1_kernel_size = batch.req_to_token_pool.kernel_size
+        k1_kernel_stride = batch.req_to_token_pool.kernel_stride
         for i in range(bs):
             if batch.token_num_sparse_k1_cpu[i] > 0:
+                seq_len = batch.seq_lens_cpu[i].item()
+                k1_len = (seq_len - k1_kernel_size) // k1_kernel_stride + 1 if seq_len >= k1_kernel_size else 0
                 batch.req_to_token_pool.write_sparse_k1(
-                    (batch.req_pool_indices[i], (0, batch.token_num_sparse_k1_cpu[i])),
+                    (batch.req_pool_indices[i], (k1_len, batch.token_num_sparse_k1_cpu[i] + k1_len)),
                     sparse_k1_loc[pt : pt + batch.token_num_sparse_k1_cpu[i]].to(torch.int32),
                 )
                 pt += batch.token_num_sparse_k1_cpu[i]
     if sparse_k2_loc is not None:
         pt = 0
+        k2_kernel_size = batch.req_to_token_pool.kernel_size * 4
+        k2_kernel_stride = batch.req_to_token_pool.kernel_stride * 4
         for i in range(bs):
             if batch.token_num_sparse_k2_cpu[i] > 0:
+                seq_len = batch.seq_lens_cpu[i].item()
+                k2_len = (seq_len - k2_kernel_size) // k2_kernel_stride + 1 if seq_len >= k2_kernel_size else 0
                 batch.req_to_token_pool.write_sparse_k2(
-                    (batch.req_pool_indices[i], (0, batch.token_num_sparse_k2_cpu[i])),
+                    (batch.req_pool_indices[i], (k2_len, batch.token_num_sparse_k1_cpu[i] + k2_len)),
                     sparse_k2_loc[pt : pt + batch.token_num_sparse_k2_cpu[i]].to(torch.int32),
                 )
                 pt += batch.token_num_sparse_k2_cpu[i]
