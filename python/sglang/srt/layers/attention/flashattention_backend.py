@@ -472,7 +472,7 @@ class FlashAttentionBackend(AttentionBackend):
             self.sparse_topk = topk + (self.window_size // self.block_size)
             self.num_sparse_topk_tokens = self.block_size * self.sparse_topk
 
-            self.compress_k = CompressK(2, 128, kernel_size=self.kernel_size, kernel_stride=self.kernel_stride)
+            self.compress_k1 = CompressK(2, 128, kernel_size=self.kernel_size, kernel_stride=self.kernel_stride)
             self.compress_k2 = CompressK(2, 128, kernel_size=self.kernel_size*4, kernel_stride=self.kernel_stride*4)
 
     def update_batch_for_sparse(self, forward_batch: ForwardBatch, metadata: FlashAttentionMetadata):
@@ -935,7 +935,7 @@ class FlashAttentionBackend(AttentionBackend):
                         attention_mask=attention_mask,
                         layer=layer,
                         forward_batch=forward_batch,
-                        compress_k=self.compress_k,
+                        compress_k1=self.compress_k1,
                         compress_k2=self.compress_k2,
                         batch_id=i
                     )
@@ -954,7 +954,7 @@ class FlashAttentionBackend(AttentionBackend):
                     attention_mask=attention_mask,
                     layer=layer,
                     forward_batch=forward_batch,
-                    compress_k=self.compress_k,
+                    compress_k1=self.compress_k1,
                     compress_k2=self.compress_k2,
                     batch_id=i
                 )
@@ -1012,7 +1012,7 @@ class FlashAttentionBackend(AttentionBackend):
                 attention_mask=attention_mask,
                 layer=layer,
                 forward_batch=forward_batch,
-                compress_k=self.compress_k,
+                compress_k1=self.compress_k1,
                 compress_k2=self.compress_k2,
                 batch_id=decode_batch_id
             )
@@ -1227,7 +1227,7 @@ class FlashAttentionBackend(AttentionBackend):
                     attention_mask=attention_mask,
                     layer=layer,
                     forward_batch=forward_batch,
-                    compress_k=self.compress_k,
+                    compress_k1=self.compress_k1,
                     compress_k2=self.compress_k2
                 )  
 
@@ -1706,7 +1706,7 @@ class FlashAttentionBackend(AttentionBackend):
                             attention_mask=attention_mask,
                             layer=layer,
                             forward_batch=forward_batch,
-                            compress_k=self.compress_k,
+                            compress_k1=self.compress_k1,
                             compress_k2=self.compress_k2
                         )
 

@@ -176,7 +176,7 @@ class CompressK(torch.nn.Module):
             k (torch.Tensor): Input key tensor of shape (total_seq_len, num_heads, head_dim).
             cu_seqlens (torch.Tensor): Cumulative sequence lengths for each sample in the batch, typically used for handling variable-length sequences.
         Returns:
-            compress_k (torch.Tensor): Compressed key tensor.
+            compress_k1 (torch.Tensor): Compressed key tensor.
             cu_seqlens_compressed (torch.Tensor): Updated cumulative sequence lengths after compression.
         """
         # Compute chunk-related metadata, with stride support
@@ -242,7 +242,7 @@ def batched_gather(a, cu_seqlen_q, select):
 def get_compress_k(key_states, attention_mask, 
                     layer,
                     forward_batch,
-                    compress_k: CompressK,
+                    compress_k1: CompressK,
                     compress_k2: CompressK,
                     batch_id = 0):
     # only support batch size 1 for now
@@ -252,10 +252,10 @@ def get_compress_k(key_states, attention_mask,
         past_token_num = forward_batch.extend_prefix_lens_cpu[batch_id]
     else: # decode
         past_token_num = forward_batch.seq_lens_cpu[batch_id] - 1
-    past_compress_k1_token_num = (past_token_num - compress_k.kernel_size) // compress_k.kernel_stride + 1 if past_token_num >= compress_k.kernel_size else 0
+    past_compress_k1_token_num = (past_token_num - compress_k1.kernel_size) // compress_k1.kernel_stride + 1 if past_token_num >= compress_k1.kernel_size else 0
     past_compress_k2_token_num = (past_token_num - compress_k2.kernel_size) // compress_k2.kernel_stride + 1 if past_token_num >= compress_k2.kernel_size else 0
 
-    k1_compress_idx_st = 0 if past_compress_k1_token_num == 0 else (past_compress_k1_token_num - 1) * compress_k.kernel_stride + compress_k.kernel_stride
+    k1_compress_idx_st = 0 if past_compress_k1_token_num == 0 else (past_compress_k1_token_num - 1) * compress_k1.kernel_stride + compress_k1.kernel_stride
     k2_compress_idx_st = 0 if past_compress_k2_token_num == 0 else (past_compress_k2_token_num - 1) * compress_k2.kernel_stride + compress_k2.kernel_stride
 
     token_num = forward_batch.seq_lens_cpu[batch_id].item()
@@ -276,12 +276,12 @@ def get_compress_k(key_states, attention_mask,
 
     new_k1_num, new_k2_num = 0, 0
 
-    if k1.shape[1] >= compress_k.kernel_size:
+    if k1.shape[1] >= compress_k1.kernel_size:
         attention_mask = torch.ones(k1.shape[0], k1.shape[1], dtype=torch.int64, device=k1.device)
         unpadded_key_states, _, cu_seqlens, _ = _unpad_one_tensor(k1,attention_mask=attention_mask)
-        compressed_k1, compressed_cu_seqlens = compress_k(unpadded_key_states, cu_seqlens)
+        compressed_k1, compressed_cu_seqlens = compress_k1(unpadded_key_states, cu_seqlens)
         seq_len = k1.shape[1]
-        new_k1_num = (seq_len - compress_k.kernel_size) // compress_k.kernel_stride + 1
+        new_k1_num = (seq_len - compress_k1.kernel_size) // compress_k1.kernel_stride + 1
 
         forward_batch.token_to_kv_pool.set_kv_buffer(
             layer, forward_batch.sparse_k1_loc[
