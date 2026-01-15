@@ -367,7 +367,7 @@ def compressed_attention(
             max_seqlen_k=max_seqlen_k,
             causal=is_prefilling
         )
-        score = score[:, :q_idx.shape[0], :]  # [num_heads, total_q_len, num_blocks]
+        # score = score[:, :q_idx.shape[0], :]  # [num_heads, total_q_len, num_blocks]
 
         block_score = max_pooling_1d_varlen(
             score.contiguous(),
@@ -1051,8 +1051,11 @@ class FlashAttentionBackend(AttentionBackend):
                 return ret
             assert False, "test_prefill must be True for prefill sparse attention"
         else:
-            bs = query_states.shape[0]
-            assert bs == 1
+            # bs = query_states.shape[0]
+            # assert bs == 1
+            # assume bs = 1 for decode
+            bs = 1
+            metadata = self.forward_metadata
             kv_len = forward_batch.seq_lens_cpu[decode_batch_id]
             attention_mask = torch.ones(bs, kv_len, dtype=torch.int64, device=query_states.device)
             compressed_k, compressed_cu_seqlens, compressed_k2, compressed_cu_seqlens2 = get_compress_k(
@@ -1065,14 +1068,13 @@ class FlashAttentionBackend(AttentionBackend):
                 metadata=self.forward_metadata,
                 batch_id=decode_batch_id
             )
-            query_states = query_states.reshape(-1, query_states.shape[2], query_states.shape[3])
+            # query_states = query_states.reshape(-1, query_states.shape[2], query_states.shape[3])
+            query_states = query_states.squeeze(0)
             # as bs = 1, we can directly create cu_seqlens
-            cu_seqlens_k = torch.zeros(bs + 1, dtype=torch.int32, device=query_states.device)
-            cu_seqlens_k[1] = kv_len
-            max_seqlen_in_batch_k = kv_len
-            cu_seqlens_q = torch.zeros(bs + 1, dtype=torch.int32, device=query_states.device)
-            cu_seqlens_q[1] = query_states.shape[0]
-            max_seqlen_in_batch_q = query_states.shape[0]
+            cu_seqlens_k = metadata.cu_seqlens_k
+            max_seqlen_in_batch_k = metadata.max_seq_len_k
+            cu_seqlens_q = metadata.cu_seqlens_q
+            max_seqlen_in_batch_q = 1 # decode one token each time
 
             ret = self.sparse_get_topk_impl(
                         query_states,
