@@ -420,7 +420,8 @@ def original_get_compress_k(key_states, attention_mask,
 
 
 
-def new_get_compress_k(key_states, attention_mask, 
+def new_get_compress_k(key_states, 
+                    #    attention_mask, 
                     layer,
                     forward_batch,
                     compress_k: CompressK,
@@ -528,14 +529,18 @@ def new_get_compress_k(key_states, attention_mask,
     return full_compressed_k1, full_compressed_cu_seqlens, full_compressed_k2, full_compressed_cu_seqlens2
 
 
-def get_compress_k(key_states, attention_mask, 
+def get_compress_k(key_states, 
+                #    attention_mask, 
                     layer,
                     forward_batch,
                     compress_k1: CompressK,
                     compress_k2: CompressK,
                     metadata: "FlashAttentionMetadata",
+                    k1: torch.Tensor = None,
+                    k2: torch.Tensor = None,
                     batch_id = 0):
-        new_results = new_get_compress_k(key_states, attention_mask, layer, forward_batch, compress_k1, compress_k2, metadata, batch_id)
+        # TODO: if k1&k2 not None, write directly to k1&k2 and return k1&k2
+        new_results = new_get_compress_k(key_states, layer, forward_batch, compress_k1, compress_k2, metadata, batch_id)
         if False:
             original_results = original_get_compress_k(key_states, attention_mask, layer, forward_batch, compress_k1, compress_k2, batch_id)
             #__import__('fpdb').ForkedPdb().set_trace()
