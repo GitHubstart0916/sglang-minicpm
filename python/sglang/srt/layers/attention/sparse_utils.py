@@ -616,7 +616,7 @@ def compress_k_core_new(
     return
 
 
-def new_get_compress_k_batch(layer,
+def get_compress_k_v2(layer,
                     forward_batch,
                     metadata: "FlashAttentionMetadata",
                     full_compressed_k1,

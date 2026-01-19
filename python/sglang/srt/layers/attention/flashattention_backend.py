@@ -29,7 +29,7 @@ from infllm_v2 import (
     max_pooling_1d_varlen
 )
 
-from sglang.srt.layers.attention.sparse_utils import CompressK, get_compress_k, new_get_compress_k_batch, batched_gather
+from sglang.srt.layers.attention.sparse_utils import CompressK, get_compress_k, get_compress_k_v2, batched_gather
 import sparse_kernel_extension
 import torch.nn.functional as F
 
@@ -1105,7 +1105,7 @@ class FlashAttentionBackend(AttentionBackend):
             # kv_len = forward_batch.seq_lens_cpu[decode_batch_id]
 
             if self.enable_cuda_graph:
-                new_get_compress_k_batch(
+                get_compress_k_v2(
                     layer=layer,
                     forward_batch=forward_batch,
                     metadata=metadata,
@@ -1124,7 +1124,7 @@ class FlashAttentionBackend(AttentionBackend):
                     device=self.device
                 )
 
-                new_get_compress_k_batch(
+                get_compress_k_v2(
                     layer=layer,
                     forward_batch=forward_batch,
                     metadata=metadata,

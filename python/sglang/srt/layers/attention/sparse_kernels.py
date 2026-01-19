@@ -134,6 +134,7 @@ def compress_k_complete_kernel(
 
 
 
+# TODO. Now only page size == 1 is supported. Consider extend to page size > 1
 @triton.jit
 def compress_k_complete_kernel_new(
     key_cache_ptr,
