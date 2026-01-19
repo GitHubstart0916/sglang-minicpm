@@ -10,7 +10,7 @@ if TYPE_CHECKING:
     from sglang.srt.layers.attention.flashattention_backend import FlashAttentionMetadata
 
 from sglang.srt.layers.attention.sparse_kernels import (
-    compress_k_complete_kernel,
+    compress_k_complete_kernel, compress_k_complete_kernel_new
 )
 import triton
 
@@ -553,4 +553,144 @@ def get_compress_k(key_states,
             if (original_results[3].numel() > 0):
                 assert(torch.equal(original_results[3], new_results[3]))
         return new_results
+
+
+
+
+
+
+
+def compress_k_core_new(
+        full_compressed_k, # output
+        layer, batch, k_stride, token_to_kv_pool, key_cache, token_table, compressed_k_table, new_k_token_nums, cu_new_k_token_nums, history_compress_k_token_nums, cu_new_compress_k_token_nums, new_compress_k_token_nums, total_compress_k_token_nums, cu_total_compress_k_token_nums, kernel_size, kernel_stride, max_context_length):
+
+    head_num_k = key_cache.shape[1]
+    head_dim = key_cache.shape[2]
+
+    # ==============================================================================
+    # BUFFER ALLOCATION
+    # ==============================================================================
+
+    # Use provided explicit parameters for buffer allocation
+    # max_chunks_per_seq is already the maximum possible chunks for any sequence
+    # given max_context_length, kernel_size, and kernel_stride
+    max_chunks_per_seq = max(0, (max_context_length - kernel_size) // kernel_stride + 1)
+
+    # ==============================================================================
+    # Launch kernel for ALL chunks (history + new)
+    # ==============================================================================
+    # Grid: (batch, max_chunks_per_seq, head_num_k)
+    # - chunk_in_seq in [0, history_compress): process HISTORY chunks
+    # - chunk_in_seq in [history_compress, total_chunks_in_seq): process NEW chunks
+    #
+    # max_chunks_per_seq is already the maximum possible chunks for any sequence,
+    # so it's sufficient for both history and new chunks.
+    #
+    # All operations are in a single kernel, CUDA graph compatible.
+
+    BLOCK_SIZE = triton.next_power_of_2(head_dim)
+    grid = (batch, max_chunks_per_seq, head_num_k)
+
+    compress_k_complete_kernel_new[grid](
+        key_cache,
+        token_table,
+        cu_new_k_token_nums,
+        history_compress_k_token_nums,
+        k_stride,
+        compressed_k_table,
+        cu_new_compress_k_token_nums,
+        cu_total_compress_k_token_nums,
+        total_compress_k_token_nums,
+        full_compressed_k,
+        batch,
+        max_chunks_per_seq,
+        token_table.shape[1],
+        compressed_k_table.shape[1],
+        head_num_k,
+        head_dim,
+        kernel_size,
+        kernel_stride,
+        BLOCK_SIZE,
+    )
+
+    return
+
+
+def get_compress_k_v2(layer,
+                    forward_batch,
+                    metadata: "FlashAttentionMetadata",
+                    full_compressed_k1,
+                    full_compressed_k2):
+    batch = len(forward_batch.req_pool_indices)
+    max_context_length = 20480
+
+    # k1 stride is 16, window is 32
+    # k2 stride is 64, windiw is 128
+    k1_stride = 16
+    k1_l = 32
+    k2_stride = 64
+    k2_l = 128
+
+    #################### prepare arguments ##############################
+    # TODO in summary, the arguments needed are:
+    # key_cache [-1, head_num, head_size]
+    # metadata.cu_seqlens_q [batch_size + 1]
+    # metadata.cu_seqlens_k [batch_size + 1]
+    # token_table [batch_size, token_num]: the pre-allocated locs of normal tokens
+    # k1_table [batch_size, total_compress_k1_token_num]: the pre-allocated locs of compress k1 tokens
+    # k2_table [batch_size, total_compress_k2_token_num]: the pre-allocated locs of compress k2 tokens
+    # theses arguments should be dirrectly passed in
+
+    req_ids = forward_batch.req_pool_indices
+    req_to_token_pool = forward_batch.req_to_token_pool
+
+    token_to_kv_pool = forward_batch.token_to_kv_pool
+    
+    key_cache = token_to_kv_pool.get_key_buffer(layer.layer_id)
+    key_cache = key_cache.view(-1, layer.tp_k_head_num, layer.head_dim)
+
+    token_table = req_to_token_pool.req_to_token[req_ids]
+
+    k1_table = req_to_token_pool.req_to_sparse_k1_token[req_ids]
+    k2_table = req_to_token_pool.req_to_sparse_k2_token[req_ids]
+    ##################### prepare of computation ######################
+
+    # token_nums = history_lens + input_lens
+    token_nums = metadata.cu_seqlens_k[1:] - metadata.cu_seqlens_k[:-1]
+    input_lens = metadata.cu_seqlens_q[1:] - metadata.cu_seqlens_q[:-1]
+    history_lens = token_nums - input_lens
+
+    # history compressed tokens
+    history_compress_k1_token_nums = torch.maximum((history_lens - k1_l) // k1_stride + 1, torch.tensor(0,device=history_lens.device))
+    history_compress_k2_token_nums = torch.maximum((history_lens - k2_l) // k2_stride + 1, torch.tensor(0,device=history_lens.device))
+    
+    # new tokens
+    new_k1_token_nums = token_nums - history_compress_k1_token_nums * k1_stride
+    new_k2_token_nums = token_nums - history_compress_k2_token_nums * k2_stride
+
+    cu_new_k1_token_nums = F.pad(torch.cumsum(new_k1_token_nums, dim=0, dtype=torch.int32), (1, 0))
+    cu_new_k2_token_nums = F.pad(torch.cumsum(new_k2_token_nums, dim=0, dtype=torch.int32), (1, 0))
+
+    # new compressed tokens
+    new_compress_k1_token_nums = torch.maximum((new_k1_token_nums - k1_l) // k1_stride + 1, torch.tensor(0,device=new_k1_token_nums.device))
+    new_compress_k2_token_nums = torch.maximum((new_k2_token_nums - k2_l) // k2_stride + 1, torch.tensor(0,device=new_k2_token_nums.device))
+
+    # cum sum of new compressed tokens
+    cu_new_compress_k1_token_nums = F.pad(torch.cumsum(new_compress_k1_token_nums, dim = 0, dtype=torch.int32), (1,0))
+    cu_new_compress_k2_token_nums = F.pad(torch.cumsum(new_compress_k2_token_nums, dim = 0, dtype=torch.int32), (1,0))
+
+    # total compressed tokens
+    total_compress_k1_token_nums = history_compress_k1_token_nums + new_compress_k1_token_nums
+    total_compress_k2_token_nums = history_compress_k2_token_nums + new_compress_k2_token_nums
+
+    cu_total_compress_k1_token_nums = F.pad(torch.cumsum(total_compress_k1_token_nums, dim = 0, dtype=torch.int32), (1, 0))
+    cu_total_compress_k2_token_nums = F.pad(torch.cumsum(total_compress_k2_token_nums, dim = 0, dtype=torch.int32), (1, 0))
+
+    # deal with k1
+    compress_k_core_new(full_compressed_k1, layer, batch, k1_stride, token_to_kv_pool, key_cache, token_table, k1_table, new_k1_token_nums, cu_new_k1_token_nums, history_compress_k1_token_nums, cu_new_compress_k1_token_nums, new_compress_k1_token_nums, total_compress_k1_token_nums, cu_total_compress_k1_token_nums, k1_l, k1_stride, max_context_length)
+
+    # deal with k2
+    compress_k_core_new(full_compressed_k2, layer, batch, k2_stride, token_to_kv_pool, key_cache, token_table, k2_table, new_k2_token_nums, cu_new_k2_token_nums, history_compress_k2_token_nums, cu_new_compress_k2_token_nums, new_compress_k2_token_nums, total_compress_k2_token_nums, cu_total_compress_k2_token_nums, k2_l, k2_stride, max_context_length)
+
+    return
 

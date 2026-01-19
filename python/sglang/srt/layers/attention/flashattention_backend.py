@@ -29,7 +29,7 @@ from infllm_v2 import (
     max_pooling_1d_varlen
 )
 
-from sglang.srt.layers.attention.sparse_utils import CompressK, get_compress_k, batched_gather
+from sglang.srt.layers.attention.sparse_utils import CompressK, get_compress_k, get_compress_k_v2, batched_gather
 import sparse_kernel_extension
 import torch.nn.functional as F
 
@@ -1101,27 +1101,37 @@ class FlashAttentionBackend(AttentionBackend):
             assert False, "test_prefill must be True for prefill sparse attention"
         else:
             # bs = query_states.shape[0]
-            # assert bs == 1
-            # assume bs = 1 for decode
-            bs = 1
             metadata = self.forward_metadata
             # kv_len = forward_batch.seq_lens_cpu[decode_batch_id]
-            # attention_mask = torch.ones(bs, kv_len, dtype=torch.int64, device=query_states.device)
-            if not self.enable_cuda_graph:
-                # if enable cuda graph, refactor this to a custom kernel
-                compressed_k, compressed_cu_seqlens, compressed_k2, compressed_cu_seqlens2 = get_compress_k(
-                    key_states=key_states,
-                    # attention_mask=attention_mask,
+
+            if self.enable_cuda_graph:
+                get_compress_k_v2(
                     layer=layer,
                     forward_batch=forward_batch,
-                    compress_k1=self.compress_k1,
-                    compress_k2=self.compress_k2,
-                    metadata=self.forward_metadata,
-                    batch_id=decode_batch_id
+                    metadata=metadata,
+                    full_compressed_k1=self.decode_cuda_graph_metadata["compress_k1"], # output
+                    full_compressed_k2=self.decode_cuda_graph_metadata["compress_k2"], # output
                 )
             else:
-                # TODO: custom kernel for cuda graph support
-                pass
+                compressed_k = torch.zeros(
+                    (self.max_context_len // self.k1_kernel_stride, self.head_group_num, self.head_dim),
+                    dtype=torch.bfloat16,
+                    device=self.device
+                        )
+                compressed_k2 = torch.zeros(
+                    (self.max_context_len // self.k2_kernel_stride, self.head_group_num, self.head_dim), 
+                    dtype=torch.bfloat16, 
+                    device=self.device
+                )
+
+                get_compress_k_v2(
+                    layer=layer,
+                    forward_batch=forward_batch,
+                    metadata=metadata,
+                    full_compressed_k1=compressed_k, # output
+                    full_compressed_k2=compressed_k2, # output
+                )
+
             # query_states = query_states.reshape(-1, query_states.shape[2], query_states.shape[3])
             query_states = query_states.squeeze(0)
             # as bs = 1, we can directly create cu_seqlens
@@ -1150,8 +1160,8 @@ class FlashAttentionBackend(AttentionBackend):
                             max_seqlen_in_batch_q,
                             max_seqlen_in_batch_k,
                             no_rope_param=no_rope_param,
-                            compressed_k=compressed_k, compressed_cu_seqlens=compressed_cu_seqlens,
-                            compressed_k2=compressed_k2, compressed_cu_seqlens2=compressed_cu_seqlens2
+                            compressed_k=compressed_k, compressed_cu_seqlens=metadata.cu_seqlens_k1,
+                            compressed_k2=compressed_k2, compressed_cu_seqlens2=metadata.cu_seqlens_k2
                 )
 
         return ret
@@ -2037,6 +2047,7 @@ class FlashAttentionBackend(AttentionBackend):
                 dtype=torch.int32, 
                 device=self.device,
             ),
+            # TODO more precisely, it is max(0, (max_context_length - kernel_size) // kernel_stride + 1)
             "compress_k1": torch.zeros(
                 (max_bs * self.max_context_len // self.k1_kernel_stride, self.head_group_num, self.head_dim), 
                 dtype=torch.bfloat16, 
