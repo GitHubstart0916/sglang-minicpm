@@ -26,7 +26,8 @@ from sgl_kernel.flash_attn import flash_attn_varlen_func, flash_attn_with_kvcach
 
 from infllm_v2 import (
     infllmv2_attn_stage1,
-    max_pooling_1d_varlen
+    max_pooling_1d_varlen,
+    max_pooling_1d_varlen_v2
 )
 
 from sglang.srt.layers.attention.sparse_utils import CompressK, get_compress_k, batched_gather
@@ -80,6 +81,9 @@ class FlashAttentionMetadata:
     swa_page_table: torch.Tensor = None
     # Page table for minicpm sparse attention
     sparse_page_table: torch.Tensor = None
+    # # Block score buffer for minicpm sparse attention
+    # block_score_buffer: torch.Tensor = None
+    total_q: int = -1 # use for max_pooling_1d_varlen
 
     # Encoder metadata
     # Cumulative sequence lengths for encoder key
@@ -344,6 +348,8 @@ def compressed_attention(
     init_blocks: int = 1,
     local_blocks: int = 2,
     cache_lens=None,
+    total_q: int = -1,
+    # block_score_buffer: torch.Tensor = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     with torch.no_grad():
         batch_size = cu_seqlens_q.shape[0] - 1
@@ -371,7 +377,6 @@ def compressed_attention(
         # Modify the compression operator to write directly to this buffer
         # Add four buffers k1, k2, cu_seqlens_k1, cu_seqlens_k2 to the decode buffer; 
         # this is reasonable since each attention requires this set of arrays
-        
         # Compute attention scores
         # 计算attention score
         score = infllmv2_attn_stage1(
@@ -382,7 +387,7 @@ def compressed_attention(
             cu_seqlens_k=cu_seqlens_k,
             cu_seqlens_v=cu_seqlens_k2,
             max_seqlen_q=max_seqlen_q,
-            max_seqlen_k=max_seqlen_k,
+            # max_seqlen_k=max_seqlen_k,
             causal=is_prefilling
         )
         
@@ -396,22 +401,25 @@ def compressed_attention(
             cu_seqlens_k,
             cache_lens,
             max_seqlen_q,
-            max_seqlen_k,
+            # max_seqlen_k,
             local_blocks=local_blocks,
             init_blocks=init_blocks,
             block_size=block_size,
-            stride=kernel_stride
+            stride=kernel_stride,
+            total_q=total_q,
+            # output=block_score_buffer,
         )  # shape: [num_heads, total_q_len, num_blocks]
 
         # print("input params: score shape {}, cu_seqlens_q shape {}, cu_seqlens_k shape {}, cache_lens shape {}, max_seqlen_q {}, max_seqlen_k {}, local_blocks {}, init_blocks {}, block_size {}, stride {}".format(
         #     score.shape, cu_seqlens_q.shape, cu_seqlens_k.shape, cache_lens.shape, max_seqlen_q, max_seqlen_k, local_blocks, init_blocks, block_size, kernel_stride
         # ))
-        # print("block_score shape {}".format(block_score.shape))
+        # print("block_score shape {} {}".format(block_score.shape, block_score.dtype))
         # get topk
         # topk = min(topk, block_score.shape[-1])
         topk_idx = block_score.topk(topk, dim=-1).indices.sort(-1).values
         topk_idx[topk_idx > q_idx[None, :, None]] = -1
         topk_idx = topk_idx.to(torch.int32)
+        # topk_idx = torch.zeros((2,1,96), dtype=torch.int32, device="cuda")  # TODO: remove this line
 
     return topk_idx
 
@@ -534,9 +542,22 @@ class FlashAttentionBackend(AttentionBackend):
             self.k2_kernel_size = self.kernel_size * 4
             self.k2_kernel_stride = self.kernel_stride * 4
 
+            # self.block_score_buffer = torch.zeros((self.head_group_num, self.max_context_len, self.max_context_len // self.block_size), dtype=torch.bfloat16, device="cuda")
+
+            self.dump = False
+            
+            if not self.dump:
+                self.mock_topks = torch.from_numpy(np.fromfile("/tmp/sglang_flashattention_decode_topk_idxs.bin", dtype=np.int32).reshape(32,2,1,96)).to(device="cuda")
+                self.mock_sparse_page_table = torch.from_numpy(np.fromfile("/tmp/sglang_flashattention_decode_sparse_page_table.bin", dtype=np.int32).reshape(32, 2, 6144)).to(device="cuda")
+            else:
+                self.mock_topks = torch.zeros((32, 2, 1, 96), dtype=torch.int32, device="cuda")
+                self.mock_sparse_page_table = torch.zeros((32, 2, 6144), dtype=torch.int32, device="cuda")
+
     def update_batch_for_sparse(self, forward_batch: ForwardBatch, metadata: FlashAttentionMetadata):
         bs = forward_batch.batch_size
         cu_seqlens_q = metadata.cu_seqlens_q
+        # metadata.block_score_buffer = self.block_score_buffer[:, :metadata.cu_seqlens_q[-1], :]
+        metadata.total_q = cu_seqlens_q[-1].item()
         seqlen_k1_cpu = torch.zeros((bs,), dtype=metadata.cu_seqlens_q.dtype, device='cpu')
         seqlen_k2_cpu = torch.zeros((bs,), dtype=metadata.cu_seqlens_q.dtype, device='cpu')
         
@@ -1189,7 +1210,8 @@ class FlashAttentionBackend(AttentionBackend):
             None,
             init_blocks=self.init_blocks,
             local_blocks=self.local_blocks,
-            cache_lens=cache_lens
+            cache_lens=cache_lens,
+            # block_score_buffer=self.forward_metadata.block_score_buffer
         )
 
         return topk_idx
@@ -1771,13 +1793,16 @@ class FlashAttentionBackend(AttentionBackend):
                                                         layer, 
                                                         forward_batch,
                                                         False)
+                    topk_idx = self.mock_topks[layer.layer_id]
                     sparse_page_table = sparse_kernel_extension.get_block_table(
                                 topk_idx,
                                 page_table,
                                 metadata.token_to_bs,
-                                metadata.token_pos_in_bs,
+                                cache_seqlens,
                                 cache_seqlens
                     ).reshape(-1, self.num_sparse_topk_tokens)
+                    
+                    # sparse_page_table = self.mock_sparse_page_table[layer.layer_id]
                     metadata.sparse_page_table[: 2 * bs, :self.num_sparse_topk_tokens] = sparse_page_table[:, :self.num_sparse_topk_tokens]
                 else:
                 # Default: single-token self-attention
@@ -1791,16 +1816,27 @@ class FlashAttentionBackend(AttentionBackend):
                                                         forward_batch,
                                                         False,
                                                         decode_batch_id=b)
-                            # print("topk idx shape {}".format(topk_idx.shape))
+                            # topk_idx = self.mock_topks[layer.layer_id]
                             # TODO: change this to modern python code 
                             ret = sparse_kernel_extension.get_block_table(
                                 topk_idx,
-                                page_table[b:b+1],
+                                page_table,
                                 metadata.token_to_bs.to(topk_idx.device),
-                                cache_seqlens[b:b+1].to(topk_idx.device),
-                                cache_seqlens[b:b+1].to(topk_idx.device)
+                                cache_seqlens,
+                                cache_seqlens
                             ).reshape(-1, self.num_sparse_topk_tokens)
 
+                            # ret = self.mock_sparse_page_table[layer.layer_id]
+                            if self.dump:
+                                print("topk idx shape {}".format(topk_idx.shape))
+                                self.mock_topks[layer.layer_id] = topk_idx
+                                if layer.layer_id == 31:
+                                    dump_path = "/tmp/sglang_flashattention_decode_topk_idxs.bin"
+                                    self.mock_topks.cpu().numpy().tofile(dump_path)
+                                self.mock_sparse_page_table[layer.layer_id] = ret
+                                if layer.layer_id == 31:
+                                    dump_path = "/tmp/sglang_flashattention_decode_sparse_page_table.bin"
+                                    self.mock_sparse_page_table.cpu().numpy().tofile(dump_path)
                             metadata.sparse_page_table[2 * b : 2 * b + 2, :self.num_sparse_topk_tokens] = ret[:, :self.num_sparse_topk_tokens]
                         else:
                             kv_len = forward_batch.seq_lens_cpu[b]
@@ -2468,6 +2504,8 @@ class FlashAttentionBackend(AttentionBackend):
                     metadata.max_seq_len_k = assume_kv_len
                     metadata.max_seq_len_k1 = assume_k1_len
                     metadata.max_seq_len_k2 = assume_k2_len
+                    
+                    metadata.total_q = bs
                     
                 
                 self.decode_cuda_graph_metadata[bs] = metadata
