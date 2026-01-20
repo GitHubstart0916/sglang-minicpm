@@ -674,7 +674,7 @@ class FlashAttentionBackend(AttentionBackend):
                                           (1, 0))
             metadata.sparse_cu_seqlens_q = torch.arange(0, bs * self.head_group_num + 1, dtype=torch.int32, device=metadata.cu_seqlens_q.device)
             # FIXME: fix this when compress_k support batch_size > 1
-            metadata.token_to_bs = torch.tensor([0], dtype=torch.int32, device='cpu')
+            metadata.token_to_bs = torch.arange(0, bs, dtype=torch.int32, device='cuda')
             metadata.sparse_page_table = torch.zeros((2 * bs, self.num_sparse_topk_tokens), dtype=page_table.dtype, device=page_table.device)
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
@@ -1135,12 +1135,12 @@ class FlashAttentionBackend(AttentionBackend):
                 )
             else:
                 compressed_k = torch.zeros(
-                    (self.max_context_len // self.k1_kernel_stride, self.head_group_num, self.head_dim),
+                    (forward_batch.batch_size * self.max_context_len // self.k1_kernel_stride, self.head_group_num, self.head_dim),
                     dtype=torch.bfloat16,
                     device=self.device
                         )
                 compressed_k2 = torch.zeros(
-                    (self.max_context_len // self.k2_kernel_stride, self.head_group_num, self.head_dim), 
+                    (forward_batch.batch_size * self.max_context_len // self.k2_kernel_stride, self.head_group_num, self.head_dim), 
                     dtype=torch.bfloat16, 
                     device=self.device
                 )
@@ -1794,76 +1794,75 @@ class FlashAttentionBackend(AttentionBackend):
                     -1, layer.tp_q_head_num, layer.head_dim
                 )
                 
-                if self.enable_cuda_graph:
-                    # only support bs 1 now
-                    topk_idx = self.get_topk_for_sparse(q_reshaped.unsqueeze(0), 
-                                                        k.unsqueeze(0), 
-                                                        v.unsqueeze(0), 
-                                                        1, 
-                                                        layer, 
-                                                        forward_batch,
-                                                        False)
-                    topk_idx = self.mock_topks[layer.layer_id]
-                    sparse_page_table = sparse_kernel_extension.get_block_table(
-                                topk_idx,
-                                page_table,
-                                metadata.token_to_bs,
-                                cache_seqlens,
-                                cache_seqlens
-                    ).reshape(-1, self.num_sparse_topk_tokens)
-                    
-                    # sparse_page_table = self.mock_sparse_page_table[layer.layer_id]
-                    metadata.sparse_page_table[: 2 * bs, :self.num_sparse_topk_tokens] = sparse_page_table[:, :self.num_sparse_topk_tokens]
-                else:
-                # Default: single-token self-attention
-                    for b in range(bs):
-                        if forward_batch.seq_lens_cpu[b] >= self.dense_len:
-                            topk_idx = self.get_topk_for_sparse(q_reshaped[b:b+1, :, :].unsqueeze(0), 
-                                                        k[b:b+1, :, :].unsqueeze(0), 
-                                                        v[b:b+1, :, :].unsqueeze(0), 
-                                                        1, 
-                                                        layer, 
-                                                        forward_batch,
-                                                        False,
-                                                        decode_batch_id=b)
-                            # topk_idx = self.mock_topks[layer.layer_id]
-                            # TODO: change this to modern python code 
-                            ret = sparse_kernel_extension.get_block_table(
-                                topk_idx,
-                                page_table,
-                                metadata.token_to_bs.to(topk_idx.device),
-                                cache_seqlens,
-                                cache_seqlens
-                            ).reshape(-1, self.num_sparse_topk_tokens)
+                # if self.enable_cuda_graph:
+                topk_idx = self.get_topk_for_sparse(q_reshaped.unsqueeze(0), 
+                                                    k.unsqueeze(0), 
+                                                    v.unsqueeze(0), 
+                                                    1, 
+                                                    layer, 
+                                                    forward_batch,
+                                                    False)
+                # topk_idx = self.mock_topks[layer.layer_id]
+                sparse_page_table = sparse_kernel_extension.get_block_table(
+                            topk_idx,
+                            page_table,
+                            metadata.token_to_bs,
+                            cache_seqlens,
+                            cache_seqlens
+                ).reshape(-1, self.num_sparse_topk_tokens)
+                
+                # sparse_page_table = self.mock_sparse_page_table[layer.layer_id]
+                metadata.sparse_page_table[: 2 * bs, :self.num_sparse_topk_tokens] = sparse_page_table[:, :self.num_sparse_topk_tokens]
+                # else:
+                # # Default: single-token self-attention
+                #     for b in range(bs):
+                #         if forward_batch.seq_lens_cpu[b] >= self.dense_len:
+                #             topk_idx = self.get_topk_for_sparse(q_reshaped[b:b+1, :, :].unsqueeze(0), 
+                #                                         k[b:b+1, :, :].unsqueeze(0), 
+                #                                         v[b:b+1, :, :].unsqueeze(0), 
+                #                                         1, 
+                #                                         layer, 
+                #                                         forward_batch,
+                #                                         False,
+                #                                         decode_batch_id=b)
+                #             # topk_idx = self.mock_topks[layer.layer_id]
+                #             # TODO: change this to modern python code 
+                #             ret = sparse_kernel_extension.get_block_table(
+                #                 topk_idx,
+                #                 page_table[b:b+1],
+                #                 metadata.token_to_bs.to(topk_idx.device),
+                #                 cache_seqlens[b:b+1].to(topk_idx.device),
+                #                 cache_seqlens[b:b+1].to(topk_idx.device)
+                #             ).reshape(-1, self.num_sparse_topk_tokens)
 
-                            # ret = self.mock_sparse_page_table[layer.layer_id]
-                            if self.dump:
-                                print("topk idx shape {}".format(topk_idx.shape))
-                                self.mock_topks[layer.layer_id] = topk_idx
-                                if layer.layer_id == 31:
-                                    dump_path = "/tmp/sglang_flashattention_decode_topk_idxs.bin"
-                                    self.mock_topks.cpu().numpy().tofile(dump_path)
-                                self.mock_sparse_page_table[layer.layer_id] = ret
-                                if layer.layer_id == 31:
-                                    dump_path = "/tmp/sglang_flashattention_decode_sparse_page_table.bin"
-                                    self.mock_sparse_page_table.cpu().numpy().tofile(dump_path)
-                            metadata.sparse_page_table[2 * b : 2 * b + 2, :self.num_sparse_topk_tokens] = ret[:, :self.num_sparse_topk_tokens]
-                        else:
-                            kv_len = forward_batch.seq_lens_cpu[b]
-                            # attention_mask = torch.ones(bs, kv_len, dtype=torch.int64, device=q_reshaped.device)
-                            # TODO key_states is not used in get_compress_k? pass in batch_id 
-                            get_compress_k(
-                                key_states=k[b:b+1, :, :].unsqueeze(0),
-                                # attention_mask=attention_mask,
-                                layer=layer,
-                                forward_batch=forward_batch,
-                                compress_k1=self.compress_k1,
-                                compress_k2=self.compress_k2,
-                                metadata=self.forward_metadata,
-                            )
-                            # this seem not suuport cuda graph, due to slice use shape
-                            metadata.sparse_page_table[2 * b, :page_table.shape[1]] = page_table[b] * 2
-                            metadata.sparse_page_table[2 * b + 1, :page_table.shape[1]] = page_table[b] * 2 + 1
+                #             # ret = self.mock_sparse_page_table[layer.layer_id]
+                #             if self.dump:
+                #                 print("topk idx shape {}".format(topk_idx.shape))
+                #                 self.mock_topks[layer.layer_id] = topk_idx
+                #                 if layer.layer_id == 31:
+                #                     dump_path = "/tmp/sglang_flashattention_decode_topk_idxs.bin"
+                #                     self.mock_topks.cpu().numpy().tofile(dump_path)
+                #                 self.mock_sparse_page_table[layer.layer_id] = ret
+                #                 if layer.layer_id == 31:
+                #                     dump_path = "/tmp/sglang_flashattention_decode_sparse_page_table.bin"
+                #                     self.mock_sparse_page_table.cpu().numpy().tofile(dump_path)
+                #             metadata.sparse_page_table[2 * b : 2 * b + 2, :self.num_sparse_topk_tokens] = ret[:, :self.num_sparse_topk_tokens]
+                #         else:
+                #             kv_len = forward_batch.seq_lens_cpu[b]
+                #             # attention_mask = torch.ones(bs, kv_len, dtype=torch.int64, device=q_reshaped.device)
+                #             # TODO key_states is not used in get_compress_k? pass in batch_id 
+                #             get_compress_k(
+                #                 key_states=k[b:b+1, :, :].unsqueeze(0),
+                #                 # attention_mask=attention_mask,
+                #                 layer=layer,
+                #                 forward_batch=forward_batch,
+                #                 compress_k1=self.compress_k1,
+                #                 compress_k2=self.compress_k2,
+                #                 metadata=self.forward_metadata,
+                #             )
+                #             # this seem not suuport cuda graph, due to slice use shape
+                #             metadata.sparse_page_table[2 * b, :page_table.shape[1]] = page_table[b] * 2
+                #             metadata.sparse_page_table[2 * b + 1, :page_table.shape[1]] = page_table[b] * 2 + 1
 
                 q_reshaped_by_head_group = q_reshaped.reshape(-1, layer.tp_q_head_num // 2, layer.head_dim)
                 assert self.page_size == 1

@@ -661,9 +661,9 @@ def get_compress_k_v2(layer,
     history_lens = token_nums - input_lens
 
     # history compressed tokens
-    history_compress_k1_token_nums = torch.maximum((history_lens - k1_l) // k1_stride + 1, torch.tensor(0,device=history_lens.device))
-    history_compress_k2_token_nums = torch.maximum((history_lens - k2_l) // k2_stride + 1, torch.tensor(0,device=history_lens.device))
-    
+    history_compress_k1_token_nums = torch.maximum((history_lens - k1_l) // k1_stride + 1, torch.zeros(1,device=history_lens.device,dtype=torch.int32))
+    history_compress_k2_token_nums = torch.maximum((history_lens - k2_l) // k2_stride + 1, torch.zeros(1,device=history_lens.device,dtype=torch.int32))
+
     # new tokens
     new_k1_token_nums = token_nums - history_compress_k1_token_nums * k1_stride
     new_k2_token_nums = token_nums - history_compress_k2_token_nums * k2_stride
@@ -672,8 +672,8 @@ def get_compress_k_v2(layer,
     cu_new_k2_token_nums = F.pad(torch.cumsum(new_k2_token_nums, dim=0, dtype=torch.int32), (1, 0))
 
     # new compressed tokens
-    new_compress_k1_token_nums = torch.maximum((new_k1_token_nums - k1_l) // k1_stride + 1, torch.tensor(0,device=new_k1_token_nums.device))
-    new_compress_k2_token_nums = torch.maximum((new_k2_token_nums - k2_l) // k2_stride + 1, torch.tensor(0,device=new_k2_token_nums.device))
+    new_compress_k1_token_nums = torch.maximum((new_k1_token_nums - k1_l) // k1_stride + 1, torch.zeros(1,device=new_k1_token_nums.device,dtype=torch.int32))
+    new_compress_k2_token_nums = torch.maximum((new_k2_token_nums - k2_l) // k2_stride + 1, torch.zeros(1,device=new_k2_token_nums.device,dtype=torch.int32))
 
     # cum sum of new compressed tokens
     cu_new_compress_k1_token_nums = F.pad(torch.cumsum(new_compress_k1_token_nums, dim = 0, dtype=torch.int32), (1,0))
