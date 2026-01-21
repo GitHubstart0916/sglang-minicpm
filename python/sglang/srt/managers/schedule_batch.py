@@ -625,6 +625,8 @@ class Req:
         # Prefix info
         # The indices to kv cache for the shared prefix.
         self.prefix_indices: torch.Tensor = torch.empty((0,), dtype=torch.int64)
+        self.prefix_k1_indices: torch.Tensor = torch.empty((0,), dtype=torch.int64)
+        self.prefix_k2_indices: torch.Tensor = torch.empty((0,), dtype=torch.int64)
         # Number of tokens to run prefill.
         self.extend_input_len = 0
         # The relative logprob_start_len in an extend batch
@@ -1440,9 +1442,17 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         if self.model_config.minicpm_sparse_config is not None:
             kernel_size = self.model_config.minicpm_sparse_config.kernel_size
             kernel_stride = self.model_config.minicpm_sparse_config.kernel_stride
-            token_num_sparse_k1 = [((len(ids) - kernel_size) // kernel_stride + 1 if len(ids) >= kernel_size else 0) for ids in input_ids]
+            token_num_sparse_k1_total = [((seq_len - kernel_size) // kernel_stride + 1 if seq_len >= kernel_size else 0) for seq_len in seq_lens]
+            token_num_sparse_k1_prefix = [((prefix_len - kernel_size) // kernel_stride + 1 if prefix_len >= kernel_size else 0) for prefix_len in prefix_lens]
+            token_num_sparse_k1 = [
+                t - p for t, p in zip(token_num_sparse_k1_total, token_num_sparse_k1_prefix)
+            ]
             token_sum_sparse_k1 = sum(token_num_sparse_k1)
-            token_num_sparse_k2 = [((len(ids) - kernel_size * 4) // (kernel_stride * 4) + 1  if len(ids) >= kernel_size * 4 else 0) for ids in input_ids]
+            token_num_sparse_k2_total = [((seq_len - kernel_size * 4) // (kernel_stride * 4) + 1  if seq_len >= kernel_size * 4 else 0) for seq_len in seq_lens]
+            token_num_sparse_k2_prefix = [((prefix_len - kernel_size * 4) // (kernel_stride * 4) + 1  if prefix_len >= kernel_size * 4 else 0) for prefix_len in prefix_lens]
+            token_num_sparse_k2 = [
+                t - p for t, p in zip(token_num_sparse_k2_total, token_num_sparse_k2_prefix)
+            ]
             token_sum_sparse_k2 = sum(token_num_sparse_k2)
 
         # For matryoshka embeddings

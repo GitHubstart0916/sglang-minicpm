@@ -72,6 +72,19 @@ class ChunkCache(BasePrefixCache):
         ]
         # `req.prefix_indices` will be used in `PrefillAdder::add_chunked_req` later
         req.prefix_indices = kv_indices.to(dtype=torch.int64, copy=True)
+        # sparse k1, k2 cache indices
+        if isinstance(self.req_to_token_pool, MiniCPMReqToTokenPool):
+            num_tokens = len(req.fill_ids)
+            num_tokens_k1 = (num_tokens - self.req_to_token_pool.kernel_size) // self.req_to_token_pool.kernel_stride + 1 if num_tokens>= self.req_to_token_pool.kernel_size else 0
+            k1_indices = self.req_to_token_pool.req_to_sparse_k1_token[
+                req.req_pool_idx, : num_tokens_k1
+            ]
+            req.prefix_k1_indices = k1_indices.to(dtype=torch.int64, copy=True)
+            num_tokens_k2 = (num_tokens - self.req_to_token_pool.kernel_size * 4) // (self.req_to_token_pool.kernel_stride * 4) + 1 if num_tokens>= self.req_to_token_pool.kernel_size * 4 else 0
+            k2_indices = self.req_to_token_pool.req_to_sparse_k2_token[
+                req.req_pool_idx, : num_tokens_k2
+            ]
+            req.prefix_k2_indices = k2_indices.to(dtype=torch.int64, copy=True)
 
     def evict(self, num_tokens: int):
         pass
