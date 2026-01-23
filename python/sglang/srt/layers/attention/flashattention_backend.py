@@ -16,6 +16,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMo
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.speculative.spec_info import SpecInput
 from sglang.srt.utils import get_compiler_backend
+from sglang.srt.distributed import get_tensor_model_parallel_world_size
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -415,6 +416,8 @@ class FlashAttentionBackend(AttentionBackend):
         self.page_size = model_runner.page_size
         self.use_mla = model_runner.model_config.attention_arch == AttentionArch.MLA
         self.skip_prefill = skip_prefill
+        tp_size = get_tensor_model_parallel_world_size()
+        self.num_kv_heads = model_runner.model_config.num_key_value_heads // tp_size
 
         self.use_sliding_window_kv_pool = (
             isinstance(model_runner.token_to_kv_pool, SWAKVPool)
@@ -471,8 +474,8 @@ class FlashAttentionBackend(AttentionBackend):
             self.sparse_topk = topk + (self.window_size // self.block_size)
             self.num_sparse_topk_tokens = self.block_size * self.sparse_topk
 
-            self.compress_k1 = CompressK(2, 128, kernel_size=self.kernel_size, kernel_stride=self.kernel_stride)
-            self.compress_k2 = CompressK(2, 128, kernel_size=self.kernel_size*4, kernel_stride=self.kernel_stride*4)
+            self.compress_k1 = CompressK(self.num_kv_heads, model_runner.model_config.hidden_size // model_runner.model_config.num_attention_heads, kernel_size=self.kernel_size, kernel_stride=self.kernel_stride)
+            self.compress_k2 = CompressK(self.num_kv_heads, model_runner.model_config.hidden_size // model_runner.model_config.num_attention_heads, kernel_size=self.kernel_size*4, kernel_stride=self.kernel_stride*4)
 
     def update_batch_for_sparse(self, forward_batch: ForwardBatch, metadata: FlashAttentionMetadata):
         if forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed():

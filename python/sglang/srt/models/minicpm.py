@@ -18,6 +18,7 @@ from typing import Any, Dict, Iterable, Optional, Tuple
 
 import torch
 from torch import nn
+import torch.nn.functional as F
 
 from sglang.srt.distributed import get_tensor_model_parallel_world_size
 from sglang.srt.layers.activation import SiluAndMul
@@ -26,6 +27,7 @@ from sglang.srt.layers.linear import (
     MergedColumnParallelLinear,
     QKVParallelLinear,
     RowParallelLinear,
+    ColumnParallelLinear,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -39,6 +41,8 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.utils import add_prefix
 
+from fla.ops.simple_gla import chunk_simple_gla
+from fla.ops.simple_gla.fused_recurrent import fused_recurrent_simple_gla
 
 class MiniCPMMLP(nn.Module):
     def __init__(
@@ -89,6 +93,8 @@ class MiniCPMAttention(nn.Module):
         rope_scaling: Optional[Dict[str, Any]] = None,
         max_position_embeddings: int = 8192,
         quant_config: Optional[QuantizationConfig] = None,
+        attn_use_rope: bool = True,
+        use_output_gate: bool = False,
         prefix: str = "",
     ) -> None:
         super().__init__()
@@ -113,6 +119,8 @@ class MiniCPMAttention(nn.Module):
         self.scaling = self.head_dim**-0.5
         self.rope_theta = rope_theta
         self.max_position_embeddings = max_position_embeddings
+        self.attn_use_rope = attn_use_rope
+        self.use_output_gate = use_output_gate
 
         self.qkv_proj = QKVParallelLinear(
             hidden_size,
@@ -131,13 +139,14 @@ class MiniCPMAttention(nn.Module):
             prefix=add_prefix("o_proj", prefix),
         )
 
-        self.rotary_emb = get_rope(
-            self.head_dim,
-            rotary_dim=self.head_dim,
-            max_position=max_position_embeddings,
-            base=rope_theta,
-            rope_scaling=rope_scaling,
-        )
+        if self.attn_use_rope:
+            self.rotary_emb = get_rope(
+                self.head_dim,
+                rotary_dim=self.head_dim,
+                max_position=max_position_embeddings,
+                base=rope_theta,
+                rope_scaling=rope_scaling,
+            )
         self.attn = RadixAttention(
             self.num_heads,
             self.head_dim,
@@ -147,6 +156,16 @@ class MiniCPMAttention(nn.Module):
             quant_config=quant_config,
             prefix=add_prefix("attn", prefix),
         )
+
+        if self.use_output_gate:
+            self.o_gate = ColumnParallelLinear(
+                hidden_size,
+                self.total_num_heads * self.head_dim,
+                bias=False,
+                quant_config=quant_config,
+                prefix=add_prefix("o_gate", prefix),
+            )
+
         self.layer_id = layer_id
 
     def forward(
@@ -157,16 +176,252 @@ class MiniCPMAttention(nn.Module):
     ) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-        orig_dtype = q.dtype
-        q, k = q.float(), k.float()
-        q, k = self.rotary_emb(positions, q, k)
-        q, k = q.to(orig_dtype), k.to(orig_dtype)
+
+        if self.attn_use_rope:
+            orig_dtype = q.dtype
+            q, k = q.float(), k.float()
+            q, k = self.rotary_emb(positions, q, k)
+            q, k = q.to(orig_dtype), k.to(orig_dtype)
+    
         attn_output = self.attn(q, k, v, forward_batch)
+
+        if self.use_output_gate:
+            o_gate_output, _ = self.o_gate(hidden_states)
+            attn_output = attn_output * F.sigmoid(o_gate_output)
+                
         output, _ = self.o_proj(attn_output)
-        
         return output
 
+def _build_slope_tensor(nheads: int):
+    def get_slopes(n):
+        def get_slopes_power_of_2(n):
+            start = 2 ** (-(2 ** -(math.log2(n) - 3)))
+            ratio = start
+            return [start * ratio**i for i in range(n)]
 
+        if math.log2(n).is_integer():
+            return get_slopes_power_of_2(
+                n
+            )  # In the paper, we only train models that have 2^a heads for some a. This function has
+        else:  # some good properties that only occur when the input is a power of 2. To maintain that even
+            closest_power_of_2 = 2 ** math.floor(
+                math.log2(n)
+            )  # when the number of heads is not a power of 2, we use this workaround.
+            return (
+                get_slopes_power_of_2(closest_power_of_2)
+                + get_slopes(2 * closest_power_of_2)[0::2][: n - closest_power_of_2]
+            )
+
+    slopes = torch.tensor(get_slopes(nheads))  # (nheads,)
+    return slopes
+
+class MiniCPMLightningAttention(nn.Module):
+    def __init__(
+        self,
+        hidden_size: int,
+        num_heads: int,
+        num_kv_heads: int,
+        head_dim: int,
+        layer_id: int = 0,
+        rope_theta: float = 10000,
+        rope_scaling: Optional[Dict[str, Any]] = None,
+        max_position_embeddings: int = 8192,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
+        use_rope: bool = True,
+        use_output_gate: bool = False,
+        attention_bias: bool = False,
+        rms_norm_eps: float = 1e-6,
+        use_output_norm: bool = False,
+        qk_norm : bool = True,
+        rope_head_dim: Optional[int] = None,
+        scale: str = '1/sqrt(d)',
+    ) -> None:
+        super().__init__()
+        self.hidden_size = hidden_size
+        tp_size = get_tensor_model_parallel_world_size()
+        self.total_num_heads = num_heads
+        assert self.total_num_heads % tp_size == 0
+        self.num_heads = self.total_num_heads // tp_size
+        self.total_num_kv_heads = num_kv_heads
+        if self.total_num_kv_heads >= tp_size:
+            # Number of KV heads is greater than TP size, so we partition
+            # the KV heads across multiple tensor parallel GPUs.
+            assert self.total_num_kv_heads % tp_size == 0
+        else:
+            # Number of KV heads is less than TP size, so we replicate
+            # the KV heads across multiple tensor parallel GPUs.
+            assert tp_size % self.total_num_kv_heads == 0
+        self.num_kv_heads = max(1, self.total_num_kv_heads // tp_size)
+        self.head_dim = head_dim
+        if scale == '1/sqrt(d)':
+            self.scale = self.head_dim ** (-0.5)
+        elif scale == '1/d':
+            self.scale = self.head_dim ** (-1.0)
+        else:
+            self.scale = 1.0
+        self.is_causal = True
+        self.use_output_gate = use_output_gate
+        self.attention_bias = attention_bias
+        self.rms_norm_eps = rms_norm_eps
+        self.use_rope = use_rope
+        self.qk_norm = qk_norm
+        self.use_output_norm = use_output_norm
+        self.rope_head_dim = rope_head_dim if rope_head_dim is not None else self.head_dim
+        assert self.rope_head_dim <= self.head_dim
+
+        self.q_size = self.num_heads * self.head_dim
+        self.kv_size = self.num_kv_heads * self.head_dim
+        self.rope_theta = rope_theta
+        self.max_position_embeddings = max_position_embeddings
+
+        self.qkv_proj = QKVParallelLinear(
+            hidden_size,
+            self.head_dim,
+            self.total_num_heads,
+            self.total_num_kv_heads,
+            bias=False,
+            quant_config=quant_config,
+            prefix=add_prefix("qkv_proj", prefix),
+        )
+        self.o_proj = RowParallelLinear(
+            self.total_num_heads * self.head_dim,
+            hidden_size,
+            bias=False,
+            quant_config=quant_config,
+            prefix=add_prefix("o_proj", prefix),
+        )
+        if self.use_output_norm:
+            self.o_norm = RMSNorm(
+                self.num_heads * self.head_dim, eps=self.rms_norm_eps
+            )
+
+        if self.use_output_gate:
+            self.z_proj = ColumnParallelLinear(
+                self.hidden_size,
+                self.total_num_heads * self.head_dim,
+                bias=self.attention_bias,
+                quant_config=quant_config,
+                prefix=add_prefix("z_proj", prefix),
+            )
+
+        if self.qk_norm:
+            self.q_norm = RMSNorm(self.head_dim, eps=self.rms_norm_eps)
+            self.k_norm = RMSNorm(self.head_dim, eps=self.rms_norm_eps)
+
+        if self.use_rope:
+            self.rotary_emb = get_rope(
+                self.head_dim,
+                rotary_dim=self.head_dim,
+                max_position=max_position_embeddings,
+                base=rope_theta,
+                rope_scaling=rope_scaling,
+            )
+
+        self.s = (
+            _build_slope_tensor(self.num_heads).to(dtype=torch.float32)
+            * (-1.0)
+        )  # (h)
+
+        self.layer_id = layer_id
+
+    def attn_fn(
+        self,
+        q: torch.Tensor,  # (b, t, h, d)
+        k: torch.Tensor,  # (b, t, h, d)
+        v: torch.Tensor,  # (b, t, h, d)
+        decay: torch.Tensor,  # (h,)
+        forward_batch: ForwardBatch,
+        scale: float | None = None,  # will use dk^(-1) if None.
+        initial_state: torch.Tensor | None = None,  # (b, h, dk, dv)
+        mode: str = 'chunk',
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if forward_batch.forward_mode.is_decode():
+            seqlen = 1
+            cu_seqlens = torch.arange(forward_batch.batch_size + 1, dtype=torch.int32, device=q.device)
+        else:
+            seqlen = torch.max(forward_batch.extend_seq_lens)
+            cu_seqlens = F.pad(forward_batch.extend_seq_lens.cumsum(dim=0), (1, 0))
+        mode = "fused_recurrent" if seqlen < 64 else "chunk"
+        if mode == "chunk":
+            o, final_state = chunk_simple_gla(
+                q=q.unsqueeze(0),
+                k=k.unsqueeze(0),
+                v=v.unsqueeze(0),
+                g_gamma=decay,  # (h,)
+                initial_state=initial_state,
+                output_final_state=True,
+                scale=scale,
+                head_first=False,
+                cu_seqlens=cu_seqlens
+            )  # (b, t, h, d)
+        elif mode == "fused_recurrent":
+            o, final_state = fused_recurrent_simple_gla(
+                q=q.unsqueeze(0),
+                k=k.unsqueeze(0),
+                v=v.unsqueeze(0),
+                g_gamma=decay,
+                scale=scale,
+                initial_state=initial_state,
+                output_final_state=True,
+                # reverse=reverse,
+                cu_seqlens=cu_seqlens,
+                # head_first=False,
+            )
+        else:
+            raise ValueError(f"Invalid mode: {mode}")
+        return o, final_state
+    
+    def forward(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ) -> torch.Tensor:  
+        qkv, _ = self.qkv_proj(hidden_states)
+        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+     
+        if self.qk_norm:
+            q = self.q_norm(q.reshape(-1, self.head_dim))
+            k = self.k_norm(k.reshape(-1, self.head_dim))
+
+        if self.use_rope:
+            q = q.reshape(-1, self.num_heads * self.head_dim)
+            k = k.reshape(-1, self.num_kv_heads * self.head_dim)
+            orig_dtype = q.dtype
+            q, k = q.float(), k.float()
+            q, k = self.rotary_emb(positions, q, k)
+            q, k = q.to(orig_dtype), k.to(orig_dtype)
+
+        q = q.reshape(-1, self.num_heads, self.head_dim)
+        k = k.reshape(-1, self.num_kv_heads, self.head_dim)
+        v = v.reshape(-1, self.num_kv_heads, self.head_dim)
+
+        #[TODO] load state
+
+        o, final_state = self.attn_fn(
+            q=q,
+            k=k,
+            v=v,
+            decay=self.s,
+            forward_batch=forward_batch,
+            initial_state=None,
+            scale=self.scale,
+        )
+
+        #[TODO] write state
+
+        o = o.reshape(-1, self.num_heads * self.head_dim)
+        if self.use_output_norm:
+            o = self.o_norm(o)
+
+        if self.use_output_gate:
+            z, _ = self.z_proj(hidden_states)
+            o = o * F.sigmoid(z)
+        
+        y, _ = self.o_proj(o)
+        return y
+    
 class MiniCPMDecoderLayer(nn.Module):
     def __init__(
         self,
@@ -178,20 +433,53 @@ class MiniCPMDecoderLayer(nn.Module):
         super().__init__()
         self.config = config
         self.hidden_size = config.hidden_size
+        if hasattr(config, "mixer_types") and config.mixer_types is not None:
+            self.mixer_type = config.mixer_types[layer_id]
+        else:
+            self.mixer_type = "minicpm4"
+        
         rope_theta = getattr(config, "rope_theta", 10000)
         rope_scaling = getattr(config, "rope_scaling", None)
         max_position_embeddings = getattr(config, "max_position_embeddings", 8192)
-        self.self_attn = MiniCPMAttention(
-            hidden_size=self.hidden_size,
-            num_heads=config.num_attention_heads,
-            num_kv_heads=config.num_key_value_heads,
-            layer_id=layer_id,
-            rope_theta=rope_theta,
-            rope_scaling=rope_scaling,
-            max_position_embeddings=max_position_embeddings,
-            quant_config=quant_config,
-            prefix=add_prefix("self_attn", prefix),
-        )
+        if self.mixer_type == "minicpm4":
+            self.self_attn = MiniCPMAttention(
+                hidden_size=self.hidden_size,
+                num_heads=config.num_attention_heads,
+                num_kv_heads=config.num_key_value_heads,
+                layer_id=layer_id,
+                rope_theta=rope_theta,
+                rope_scaling=rope_scaling,
+                max_position_embeddings=max_position_embeddings,
+                quant_config=quant_config,
+                attn_use_rope=config.attn_use_rope if hasattr(config, "attn_use_rope") else True,
+                use_output_gate=config.attn_use_output_gate if hasattr(config, "attn_use_output_gate") else False,
+                prefix=add_prefix("self_attn", prefix),
+            )
+        elif self.mixer_type in ["lightning", "lightning_attn", "lightning-attn"]:
+            assert (
+                config.head_dim is not False
+            ), "head_dim must be provided for LightningAttention"
+            self.self_attn = MiniCPMLightningAttention(
+                hidden_size=self.hidden_size,
+                num_heads=config.lightning_nh,
+                num_kv_heads=config.lightning_nkv,
+                head_dim=config.lightning_head_dim,
+                layer_id=layer_id,
+                rope_theta=rope_theta,
+                rope_scaling=rope_scaling,
+                max_position_embeddings=max_position_embeddings,
+                quant_config=quant_config,
+                use_rope=config.lightning_use_rope,
+                use_output_gate=config.use_output_gate,
+                attention_bias=config.attention_bias,
+                rms_norm_eps=config.rms_norm_eps,
+                use_output_norm=config.use_output_norm,
+                qk_norm=config.qk_norm,
+                scale=config.lightning_scale,
+                prefix=add_prefix("self_attn", prefix),
+            )
+        else:
+            raise ValueError(f"Unsupported mixer type: {self.mixer_type}")
         self.mlp = MiniCPMMLP(
             hidden_size=self.hidden_size,
             intermediate_size=config.intermediate_size,
