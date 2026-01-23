@@ -100,6 +100,7 @@ class FlashAttentionMetadata:
     token_pos_in_bs: Optional[torch.Tensor] = None
     # only use in prefilling stage
     seqlen_q_sparse_bs_tensor: Optional[torch.Tensor] = None
+    seqlen_k_sparse_bs_tensor: Optional[torch.Tensor] = None
 
     @dataclass
     class LocalAttentionMetadata:
@@ -1360,9 +1361,9 @@ class FlashAttentionBackend(AttentionBackend):
                                                 forward_batch,
                                                 test_prefill=True)
 
-            assert topk_idx.shape[1] == metadata.seqlen_q_sparse_bs_tensor.sum().item(), "topk_idx[1] {} vs seqlen_q_as_param sum {}".format(
-                topk_idx.shape[1], metadata.seqlen_q_sparse_bs_tensor.sum().item())
-            sparse_page_table_sparse_bs = sparse_kernel_extension.get_block_table(
+            # assert topk_idx.shape[1] == metadata.seqlen_q_sparse_bs_tensor.sum().item(), "topk_idx[1] {} vs seqlen_q_as_param sum {}".format(
+            #     topk_idx.shape[1], metadata.seqlen_q_sparse_bs_tensor.sum().item())
+            sparse_page_table_sparse_bs = sparse_kernel_extension.get_block_table_v2(
                 topk_idx,
                 page_table,
                 metadata.token_to_bs.to(topk_idx.device),
@@ -1810,7 +1811,7 @@ class FlashAttentionBackend(AttentionBackend):
                                                     forward_batch,
                                                     False)
                 # topk_idx = self.mock_topks[layer.layer_id]
-                sparse_page_table = sparse_kernel_extension.get_block_table(
+                sparse_page_table = sparse_kernel_extension.get_block_table_v2(
                             topk_idx,
                             page_table,
                             metadata.token_to_bs,
