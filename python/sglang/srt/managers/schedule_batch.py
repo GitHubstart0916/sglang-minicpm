@@ -1326,6 +1326,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     
     total_compress_k2_token_nums_cpu: Optional[torch.Tensor] = None
     cu_total_compress_k2_token_nums_cpu: Optional[torch.Tensor] = None
+    
+    cache_seqlens_int32_stage1_cpu: Optional[torch.Tensor] = None
 
     @classmethod
     def init_new(
@@ -2059,6 +2061,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             )
             
             self.sparse_cache_seqlens_int32_cpu = torch.repeat_interleave(sparse_cache_seqlens_cpu, 2)
+            self.cache_seqlens_int32_stage1_cpu = self.seq_lens_cpu - 1
             
             self.sparse_cu_seqlens_k_cpu = F.pad(torch.cumsum(self.sparse_cache_seqlens_int32_cpu, dim=0, dtype=torch.int32), (1, 0))
             
@@ -2326,7 +2329,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             cu_new_compress_k2_token_nums_cpu=self.cu_new_compress_k2_token_nums_cpu,
             total_compress_k2_token_nums_cpu=self.total_compress_k2_token_nums_cpu,
             cu_total_compress_k2_token_nums_cpu=self.cu_total_compress_k2_token_nums_cpu,
-            
+            cache_seqlens_int32_stage1_cpu=self.cache_seqlens_int32_stage1_cpu,
         )
 
     def copy(self):
@@ -2497,3 +2500,4 @@ class ModelWorkerBatch:
     
     total_compress_k2_token_nums_cpu: Optional[torch.Tensor] = None
     cu_total_compress_k2_token_nums_cpu: Optional[torch.Tensor] = None
+    cache_seqlens_int32_stage1_cpu: Optional[torch.Tensor] = None
