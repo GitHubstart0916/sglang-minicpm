@@ -129,6 +129,41 @@ class Mamba2CacheParams(BaseLinearStateParams):
 
 
 @dataclass(kw_only=True, frozen=True)
+class SimpleGLAStateShape:
+    temporal: tuple[int, int, int]
+    
+    num_heads: int
+    head_dim: int
+    state_size: int
+    
+    @staticmethod
+    def create(
+        *,
+        tp_world_size: int,
+        num_heads: int,
+        head_dim: int,
+        state_size: int,
+    ) -> "SimpleGLAStateShape":
+        temporal_state_shape = (divide(num_heads, tp_world_size), head_dim, state_size)
+        return SimpleGLAStateShape(
+            temporal=temporal_state_shape,
+            num_heads=num_heads,
+            head_dim=head_dim,
+            state_size=state_size,
+        )
+
+
+@dataclass(kw_only=True, frozen=True)  
+class SimpleGLACacheParams(BaseLinearStateParams):
+    shape: SimpleGLAStateShape
+    
+    @property
+    def mamba_cache_per_req(self) -> int:
+        ssm_numel = int(np.prod(self.shape.temporal))
+        return ssm_numel * self.dtype.temporal.itemsize * len(self.layers)
+
+
+@dataclass(kw_only=True, frozen=True)
 class KimiLinearStateShape:
     conv: List[tuple[int, int]]
     temporal: tuple[int, int, int]

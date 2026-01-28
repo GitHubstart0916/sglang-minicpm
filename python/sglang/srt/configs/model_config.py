@@ -86,6 +86,12 @@ def is_minicpm_sparse(config: PretrainedConfig) -> bool:
         and getattr(config, "sparse_config", None) is not None
     )
 
+
+def is_minicpm_hybrid(config: PretrainedConfig) -> bool:
+    """Check if this is a hybrid MiniCPM model with mixed attention layers"""
+    from sglang.srt.configs.minicpm import MiniCPMHybridConfig
+    return isinstance(config, MiniCPMHybridConfig)
+
 class ModelConfig:
     def __init__(
         self,

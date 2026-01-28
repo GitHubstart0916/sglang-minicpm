@@ -161,14 +161,25 @@ class MambaPool:
         enable_memory_saver: bool = False,
         speculative_num_draft_tokens: Optional[int] = None,
     ):
-        conv_state_shape = cache_params.shape.conv
-        temporal_state_shape = cache_params.shape.temporal
-        conv_dtype = cache_params.dtype.conv
-        ssm_dtype = cache_params.dtype.temporal
+        if cache_params is not None and hasattr(cache_params.shape, 'conv') and cache_params.shape.conv:
+            conv_state_shape = cache_params.shape.conv
+            conv_dtype = cache_params.dtype.conv
+        else:
+            conv_state_shape = []
+            conv_dtype = None
+
+        if cache_params is not None:
+            temporal_state_shape = cache_params.shape.temporal
+            ssm_dtype = cache_params.dtype.temporal
+            num_mamba_layers = len(cache_params.layers)
+        else:
+            temporal_state_shape = []
+            ssm_dtype = None
+            num_mamba_layers = 0
+
         self.memory_saver_adapter = TorchMemorySaverAdapter.create(
             enable=enable_memory_saver
         )
-        num_mamba_layers = len(cache_params.layers)
 
         self.size = size
         self.device = device
@@ -183,71 +194,81 @@ class MambaPool:
             if self.enable_custom_mem_pool
             else nullcontext()
         ):
-            conv_state = [
-                torch.zeros(
-                    size=(num_mamba_layers, size + 1) + conv_shape,
-                    dtype=conv_dtype,
+            if conv_state_shape:
+                conv_state = [
+                    torch.zeros(
+                        size=(num_mamba_layers, size + 1) + conv_shape,
+                        dtype=conv_dtype,
+                        device=device,
+                    )
+                    for conv_shape in conv_state_shape
+                ]
+            else:
+                conv_state = []
+
+            if num_mamba_layers > 0:
+                temporal_state = torch.zeros(
+                    size=(num_mamba_layers, size + 1) + temporal_state_shape,
+                    dtype=ssm_dtype,
                     device=device,
                 )
-                for conv_shape in conv_state_shape
-            ]
-            temporal_state = torch.zeros(
-                size=(num_mamba_layers, size + 1) + temporal_state_shape,
-                dtype=ssm_dtype,
-                device=device,
-            )
-            if speculative_num_draft_tokens is not None:
-                # Cache intermediate SSM states per draft token during target verify
-                # Shape: [num_layers, size + 1, speculative_num_draft_tokens, HV, K, V]
-                intermediate_ssm_state_cache = torch.zeros(
-                    size=(
-                        num_mamba_layers,
-                        spec_state_size + 1,
-                        speculative_num_draft_tokens,
-                        temporal_state_shape[0],
-                        temporal_state_shape[1],
-                        temporal_state_shape[2],
-                    ),
-                    dtype=ssm_dtype,
-                    device="cuda",
-                )
-                # Cache intermediate conv windows (last K-1 inputs) per draft token during target verify
-                # Shape: [num_layers, size + 1, speculative_num_draft_tokens, dim, K-1]
-                intermediate_conv_window_cache = [
-                    torch.zeros(
+                if speculative_num_draft_tokens is not None:
+                    # Cache intermediate SSM states per draft token during target verify
+                    # Shape: [num_layers, size + 1, speculative_num_draft_tokens, HV, K, V]
+                    intermediate_ssm_state_cache = torch.zeros(
                         size=(
                             num_mamba_layers,
                             spec_state_size + 1,
                             speculative_num_draft_tokens,
-                            conv_shape[0],
-                            conv_shape[1],
+                            temporal_state_shape[0],
+                            temporal_state_shape[1],
+                            temporal_state_shape[2],
                         ),
-                        dtype=conv_dtype,
+                        dtype=ssm_dtype,
                         device="cuda",
                     )
-                    for conv_shape in conv_state_shape
-                ]
-                self.mamba_cache = self.SpeculativeState(
-                    conv=conv_state,
-                    temporal=temporal_state,
-                    intermediate_ssm=intermediate_ssm_state_cache,
-                    intermediate_conv_window=intermediate_conv_window_cache,
-                )
-                logger.info(
-                    f"Mamba Cache is allocated. "
-                    f"max_mamba_cache_size: {size}, "
-                    f"conv_state size: {get_tensor_size_bytes(conv_state) / GB:.2f}GB, "
-                    f"ssm_state size: {get_tensor_size_bytes(temporal_state) / GB:.2f}GB "
-                    f"intermediate_ssm_state_cache size: {get_tensor_size_bytes(intermediate_ssm_state_cache) / GB:.2f}GB "
-                    f"intermediate_conv_window_cache size: {get_tensor_size_bytes(intermediate_conv_window_cache) / GB:.2f}GB "
-                )
+                    # Cache intermediate conv windows (last K-1 inputs) per draft token during target verify
+                    # Shape: [num_layers, size + 1, speculative_num_draft_tokens, dim, K-1]
+                    intermediate_conv_window_cache = [
+                        torch.zeros(
+                            size=(
+                                num_mamba_layers,
+                                spec_state_size + 1,
+                                speculative_num_draft_tokens,
+                                conv_shape[0],
+                                conv_shape[1],
+                            ),
+                            dtype=conv_dtype,
+                            device="cuda",
+                        )
+                        for conv_shape in conv_state_shape
+                    ]
+                    self.mamba_cache = self.SpeculativeState(
+                        conv=conv_state,
+                        temporal=temporal_state,
+                        intermediate_ssm=intermediate_ssm_state_cache,
+                        intermediate_conv_window=intermediate_conv_window_cache,
+                    )
+                    logger.info(
+                        f"Mamba Cache is allocated. "
+                        f"max_mamba_cache_size: {size}, "
+                        f"conv_state size: {get_tensor_size_bytes(conv_state) / GB:.2f}GB, "
+                        f"ssm_state size: {get_tensor_size_bytes(temporal_state) / GB:.2f}GB "
+                        f"intermediate_ssm_state_cache size: {get_tensor_size_bytes(intermediate_ssm_state_cache) / GB:.2f}GB "
+                        f"intermediate_conv_window_cache size: {get_tensor_size_bytes(intermediate_conv_window_cache) / GB:.2f}GB "
+                    )
+                else:
+                    self.mamba_cache = self.State(conv=conv_state, temporal=temporal_state)
+                    logger.info(
+                        f"Mamba Cache is allocated. "
+                        f"max_mamba_cache_size: {size}, "
+                        f"conv_state size: {get_tensor_size_bytes(conv_state) / GB:.2f}GB, "
+                        f"ssm_state size: {get_tensor_size_bytes(temporal_state) / GB:.2f}GB "
+                    )
             else:
-                self.mamba_cache = self.State(conv=conv_state, temporal=temporal_state)
+                self.mamba_cache = self.State(conv=[], temporal=None)
                 logger.info(
-                    f"Mamba Cache is allocated. "
-                    f"max_mamba_cache_size: {size}, "
-                    f"conv_state size: {get_tensor_size_bytes(conv_state) / GB:.2f}GB, "
-                    f"ssm_state size: {get_tensor_size_bytes(temporal_state) / GB:.2f}GB "
+                    f"Mamba Cache is not allocated (num_mamba_layers={num_mamba_layers})"
                 )
             self.free_slots = torch.arange(
                 self.size, dtype=torch.int64, device=self.device
@@ -274,7 +295,8 @@ class MambaPool:
         # clear at alloc time, fill allocated slots with zeros
         for i in range(len(self.mamba_cache.conv)):
             self.mamba_cache.conv[i][:, select_index] = 0
-        self.mamba_cache.temporal[:, select_index] = 0
+        if self.mamba_cache.temporal is not None:
+            self.mamba_cache.temporal[:, select_index] = 0
 
         return select_index
 
@@ -291,9 +313,10 @@ class MambaPool:
             self.mamba_cache.conv[i][:, dst_index] = self.mamba_cache.conv[i][
                 :, src_index
             ]
-        self.mamba_cache.temporal[:, dst_index] = self.mamba_cache.temporal[
-            :, src_index
-        ]
+        if self.mamba_cache.temporal is not None:
+            self.mamba_cache.temporal[:, dst_index] = self.mamba_cache.temporal[
+                :, src_index
+            ]
         return
 
     def fork_from(self, src_index: torch.Tensor) -> Optional[torch.Tensor]:
@@ -471,9 +494,15 @@ class HybridReqToTokenPool(ReqToTokenPool):
     ):
         if isinstance(free_index, (int,)):
             free_index = [free_index]
-        super().free(free_index)
+
         if free_mamba_cache:
             mamba_index = self.req_index_to_mamba_index_mapping[free_index]
+        else:
+            mamba_index = None
+
+        super().free(free_index)
+
+        if free_mamba_cache:
             self.mamba_pool.free(mamba_index)
 
             if self.enable_mamba_extra_buffer:
@@ -493,6 +522,10 @@ class HybridReqToTokenPool(ReqToTokenPool):
                         mamba_ping_pong_track_buffer_to_free[idx_to_free]
                     )
                 self.mamba_pool.free(mamba_ping_pong_track_buffer_to_free)
+
+        self.req_index_to_mamba_index_mapping[free_index] = 0
+        if self.enable_mamba_extra_buffer:
+            self.req_index_to_mamba_ping_pong_track_buffer_mapping[free_index] = 0
 
     def clear(self):
         logger.info("Reset HybridReqToTokenPool")
@@ -539,6 +572,79 @@ class MiniCPMReqToTokenPool(ReqToTokenPool):
 
     def write_sparse_k2(self, indices, values):
         self.req_to_sparse_k2_token[indices] = values
+
+
+class MiniCPMHybridReqToTokenPool(HybridReqToTokenPool):
+    """Hybrid memory pool for MiniCPM with sparse attention and Simple GLA."""
+
+    def __init__(
+        self,
+        size: int,
+        max_context_len: int,
+        device: str,
+        enable_memory_saver: bool,
+        kernel_size: int,
+        kernel_stride: int,
+        cache_params=None,
+        mamba_size: int = None,
+        mamba_spec_state_size: int = None,
+        enable_mamba_extra_buffer: bool = False,
+        speculative_num_draft_tokens: int = None,
+        **kwargs
+    ):
+        logger.info(f"[MiniCPMHybridReqToTokenPool] Init: size={size}, max_context_len={max_context_len}, "
+                    f"kernel_size={kernel_size}, kernel_stride={kernel_stride}")
+
+        super().__init__(
+            size=size,
+            mamba_size=mamba_size if mamba_size is not None else size,
+            mamba_spec_state_size=mamba_spec_state_size if mamba_spec_state_size is not None else 0,
+            max_context_len=max_context_len,
+            device=device,
+            enable_memory_saver=enable_memory_saver,
+            cache_params=cache_params,
+            enable_mamba_extra_buffer=enable_mamba_extra_buffer,
+            speculative_num_draft_tokens=speculative_num_draft_tokens,
+        )
+
+        self.kernel_size = kernel_size
+        self.kernel_stride = kernel_stride
+
+        if kernel_size is not None and kernel_stride is not None:
+            memory_saver_adapter = TorchMemorySaverAdapter.create(enable=enable_memory_saver)
+            with memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
+                k1_size = (max_context_len - kernel_size) // kernel_stride + 1
+                k2_size = (max_context_len - kernel_size * 4) // (kernel_stride * 4) + 1
+
+                self.req_to_sparse_k1_token = torch.zeros(
+                    (size, k1_size),
+                    dtype=torch.int32,
+                    device=device
+                )
+                self.req_to_sparse_k2_token = torch.zeros(
+                    (size, k2_size),
+                    dtype=torch.int32,
+                    device=device
+                )
+        else:
+            self.req_to_sparse_k1_token = None
+            self.req_to_sparse_k2_token = None
+
+    def write_sparse_k1(self, indices, values):
+        if self.req_to_sparse_k1_token is not None:
+            self.req_to_sparse_k1_token[indices] = values
+
+    def write_sparse_k2(self, indices, values):
+        if self.req_to_sparse_k2_token is not None:
+            self.req_to_sparse_k2_token[indices] = values
+
+    def clear(self):
+        super().clear()
+        if self.req_to_sparse_k1_token is not None:
+            self.req_to_sparse_k1_token.zero_()
+        if self.req_to_sparse_k2_token is not None:
+            self.req_to_sparse_k2_token.zero_()
+
 
 class KVCache(abc.ABC):
     @abc.abstractmethod

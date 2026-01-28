@@ -35,6 +35,7 @@ from sglang.srt.configs import (
     JetNemotronConfig,
     JetVLMConfig,
     KimiLinearConfig,
+    MiniCPMHybridConfig,
     NemotronH_Nano_VL_V2_Config,
     NemotronHConfig,
     Qwen3NextConfig,
@@ -1490,8 +1491,15 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         return None
 
     @property
+    def minicpm_hybrid_config(self):
+        config = self.model_config.hf_config
+        if isinstance(config, MiniCPMHybridConfig):
+            return config
+        return None
+
+    @property
     def mambaish_config(self):
-        return self.mamba2_config or self.hybrid_gdn_config or self.kimi_linear_config
+        return self.mamba2_config or self.hybrid_gdn_config or self.kimi_linear_config or self.minicpm_hybrid_config
 
     def can_run_piecewise_cuda_graph(self):
         if self.server_args.enable_torch_compile:

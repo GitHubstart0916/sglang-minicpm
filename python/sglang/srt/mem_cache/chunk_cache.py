@@ -9,7 +9,7 @@ import torch
 
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, MatchResult
 from sglang.srt.mem_cache.swa_memory_pool import SWATokenToKVPoolAllocator
-from sglang.srt.mem_cache.memory_pool import MiniCPMReqToTokenPool
+from sglang.srt.mem_cache.memory_pool import MiniCPMReqToTokenPool, MiniCPMHybridReqToTokenPool
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -50,37 +50,48 @@ class ChunkCache(BasePrefixCache):
 
     def cache_finished_req(self, req: Req, is_insert: bool = True):
         kv_committed_len = req.pop_committed_kv_cache()
-        # For decode server: if req.output_ids is empty, we want to free all req.origin_input_ids
         kv_indices = self.req_to_token_pool.req_to_token[
             req.req_pool_idx, :kv_committed_len
         ]
         self.req_to_token_pool.free(req.req_pool_idx)
         self.token_to_kv_pool_allocator.free(kv_indices)
-        if isinstance(self.req_to_token_pool, MiniCPMReqToTokenPool):
-            k1_committed_len = (kv_committed_len - self.req_to_token_pool.kernel_size) // self.req_to_token_pool.kernel_stride + 1 if kv_committed_len >= self.req_to_token_pool.kernel_size else 0
-            if k1_committed_len > 0:
-                k1_indices = self.req_to_token_pool.req_to_sparse_k1_token[req.req_pool_idx, :k1_committed_len]
+
+        if isinstance(self.req_to_token_pool, (MiniCPMReqToTokenPool, MiniCPMHybridReqToTokenPool)):
+            kernel_size = self.req_to_token_pool.kernel_size
+            kernel_stride = self.req_to_token_pool.kernel_stride
+
+            k1_total = (kv_committed_len - kernel_size) // kernel_stride + 1 if kv_committed_len >= kernel_size else 0
+            if k1_total > 0:
+                k1_indices = self.req_to_token_pool.req_to_sparse_k1_token[req.req_pool_idx, :k1_total]
                 self.token_to_kv_pool_allocator.free(k1_indices)
-            k2_committed_len = (kv_committed_len - self.req_to_token_pool.kernel_size * 4) // (self.req_to_token_pool.kernel_stride * 4) + 1 if kv_committed_len >= self.req_to_token_pool.kernel_size * 4 else 0
-            if k2_committed_len > 0:
-                k2_indices = self.req_to_token_pool.req_to_sparse_k2_token[req.req_pool_idx, :k2_committed_len]
+
+            k2_kernel_size = kernel_size * 4
+            k2_kernel_stride = kernel_stride * 4
+            k2_total = (kv_committed_len - k2_kernel_size) // k2_kernel_stride + 1 if kv_committed_len >= k2_kernel_size else 0
+            if k2_total > 0:
+                k2_indices = self.req_to_token_pool.req_to_sparse_k2_token[req.req_pool_idx, :k2_total]
                 self.token_to_kv_pool_allocator.free(k2_indices)
 
     def cache_unfinished_req(self, req: Req, chunked=False):
+        from sglang.srt.mem_cache.memory_pool import MiniCPMHybridReqToTokenPool
         kv_indices = self.req_to_token_pool.req_to_token[
             req.req_pool_idx, : len(req.fill_ids)
         ]
         # `req.prefix_indices` will be used in `PrefillAdder::add_chunked_req` later
         req.prefix_indices = kv_indices.to(dtype=torch.int64, copy=True)
         # sparse k1, k2 cache indices
-        if isinstance(self.req_to_token_pool, MiniCPMReqToTokenPool):
+        if isinstance(self.req_to_token_pool, (MiniCPMReqToTokenPool, MiniCPMHybridReqToTokenPool)):
+            kernel_size = self.req_to_token_pool.kernel_size
+            kernel_stride = self.req_to_token_pool.kernel_stride
             num_tokens = len(req.fill_ids)
-            num_tokens_k1 = (num_tokens - self.req_to_token_pool.kernel_size) // self.req_to_token_pool.kernel_stride + 1 if num_tokens>= self.req_to_token_pool.kernel_size else 0
+            num_tokens_k1 = (num_tokens - kernel_size) // kernel_stride + 1 if num_tokens >= kernel_size else 0
             k1_indices = self.req_to_token_pool.req_to_sparse_k1_token[
                 req.req_pool_idx, : num_tokens_k1
             ]
             req.prefix_k1_indices = k1_indices.to(dtype=torch.int64, copy=True)
-            num_tokens_k2 = (num_tokens - self.req_to_token_pool.kernel_size * 4) // (self.req_to_token_pool.kernel_stride * 4) + 1 if num_tokens>= self.req_to_token_pool.kernel_size * 4 else 0
+            k2_kernel_size = kernel_size * 4
+            k2_kernel_stride = kernel_stride * 4
+            num_tokens_k2 = (num_tokens - k2_kernel_size) // k2_kernel_stride + 1 if num_tokens >= k2_kernel_size else 0
             k2_indices = self.req_to_token_pool.req_to_sparse_k2_token[
                 req.req_pool_idx, : num_tokens_k2
             ]

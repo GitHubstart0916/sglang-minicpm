@@ -193,6 +193,7 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
             HybridLinearAttnBackend,
             KimiLinearAttnBackend,
             Mamba2AttnBackend,
+            SimpleGLAAttnBackend,
         )
         from sglang.srt.utils import is_blackwell, is_npu
 
@@ -213,9 +214,11 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
             linear_attn_backend = Mamba2AttnBackend(runner)
         elif runner.kimi_linear_config is not None:
             linear_attn_backend = KimiLinearAttnBackend(runner)
+        elif runner.minicpm_hybrid_config is not None:
+            linear_attn_backend = SimpleGLAAttnBackend(runner)
         else:
             raise ValueError(
-                "Expected hybrid GDN or NemotronH models, but got unknown model."
+                "Expected hybrid GDN, NemotronH, or MiniCPM hybrid models, but got unknown model."
             )
         full_attn_layers = cfg.full_attention_layer_ids
         return HybridLinearAttnBackend(

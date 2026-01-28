@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional
 
 import torch
 import triton
@@ -95,8 +95,8 @@ def write_cache_indices(
     prefix_k1_tensors: list[torch.Tensor],
     prefix_k2_tensors: list[torch.Tensor],
     req_to_token_pool: ReqToTokenPool,
-    kernel_size: int,
-    kernel_stride: int,
+    kernel_size: Optional[int],
+    kernel_stride: Optional[int],
 ):
     if support_triton(get_global_server_args().attention_backend):
         prefix_pointers = torch.tensor(
@@ -138,7 +138,7 @@ def write_cache_indices(
     for i in range(bs):
         req_idx = req_pool_indices_cpu[i].item()
         prefix_len = prefix_lens_cpu[i].item()
-        k1_len = (prefix_len - kernel_size) // kernel_stride + 1 if prefix_len >= kernel_size else 0
+        k1_len = (prefix_len - kernel_size) // kernel_stride + 1 if kernel_size is not None and kernel_stride > 0 and prefix_len >= kernel_size else 0
         if k1_len > 0:
             req_to_token_pool.write_sparse_k1(
                     (req_idx, slice(0, k1_len)),
@@ -151,12 +151,12 @@ def write_cache_indices(
             )
             pt += token_num_sparse_k1_cpu[i]
     pt = 0
-    k2_kernel_size = kernel_size * 4
-    k2_kernel_stride = kernel_stride * 4
+    k2_kernel_size = kernel_size * 4 if kernel_size is not None else None
+    k2_kernel_stride = kernel_stride * 4 if kernel_stride is not None else None
     for i in range(bs):
         req_idx = req_pool_indices_cpu[i].item()
         prefix_len = prefix_lens_cpu[i].item()
-        k2_len = (prefix_len - k2_kernel_size) // k2_kernel_stride + 1 if prefix_len >= k2_kernel_size else 0
+        k2_len = (prefix_len - k2_kernel_size) // k2_kernel_stride + 1 if k2_kernel_size is not None and k2_kernel_stride > 0 and prefix_len >= k2_kernel_size else 0
         if k2_len > 0:
             req_to_token_pool.write_sparse_k2(
                     (req_idx, slice(0, k2_len)),
@@ -457,8 +457,8 @@ def alloc_for_extend(
         prefix_k1_tensors,
         prefix_k2_tensors,
         batch.req_to_token_pool,
-        batch.req_to_token_pool.kernel_size,
-        batch.req_to_token_pool.kernel_stride,
+        batch.req_to_token_pool.kernel_size if hasattr(batch.req_to_token_pool, 'kernel_size') else None,
+        batch.req_to_token_pool.kernel_stride if hasattr(batch.req_to_token_pool, 'kernel_stride') else None,
     )
 
     return out_cache_loc, sparse_k1_loc, sparse_k2_loc, req_pool_indices_device, req_pool_indices
@@ -566,7 +566,7 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
                 seq_len = batch.seq_lens_cpu[i].item()
                 k2_len = (seq_len - k2_kernel_size) // k2_kernel_stride + 1 if seq_len >= k2_kernel_size else 0
                 batch.req_to_token_pool.write_sparse_k2(
-                    (batch.req_pool_indices[i], (k2_len, batch.token_num_sparse_k1_cpu[i] + k2_len)),
+                    (batch.req_pool_indices[i], (k2_len, batch.token_num_sparse_k2_cpu[i] + k2_len)),
                     sparse_k2_loc[pt : pt + batch.token_num_sparse_k2_cpu[i]].to(torch.int32),
                 )
                 pt += batch.token_num_sparse_k2_cpu[i]

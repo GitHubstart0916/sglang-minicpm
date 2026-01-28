@@ -14,6 +14,8 @@
 """Inference-only MiniCPM model compatible with HuggingFace weights."""
 
 import math
+import os
+import warnings
 from typing import Any, Dict, Iterable, Optional, Tuple
 
 import torch
@@ -43,6 +45,8 @@ from sglang.srt.utils import add_prefix
 
 from fla.ops.simple_gla import chunk_simple_gla
 from fla.ops.simple_gla.fused_recurrent import fused_recurrent_simple_gla
+
+from sglang.srt.layers.attention.hybrid_linear_attn_backend import SimpleGLAAttnBackend
 
 class MiniCPMMLP(nn.Module):
     def __init__(
@@ -192,30 +196,15 @@ class MiniCPMAttention(nn.Module):
         output, _ = self.o_proj(attn_output)
         return output
 
-def _build_slope_tensor(nheads: int):
-    def get_slopes(n):
-        def get_slopes_power_of_2(n):
-            start = 2 ** (-(2 ** -(math.log2(n) - 3)))
-            ratio = start
-            return [start * ratio**i for i in range(n)]
 
-        if math.log2(n).is_integer():
-            return get_slopes_power_of_2(
-                n
-            )  # In the paper, we only train models that have 2^a heads for some a. This function has
-        else:  # some good properties that only occur when the input is a power of 2. To maintain that even
-            closest_power_of_2 = 2 ** math.floor(
-                math.log2(n)
-            )  # when the number of heads is not a power of 2, we use this workaround.
-            return (
-                get_slopes_power_of_2(closest_power_of_2)
-                + get_slopes(2 * closest_power_of_2)[0::2][: n - closest_power_of_2]
-            )
+class MiniCPMLightningMixer(nn.Module):
+    """Lightning attention mixer that uses SimpleGLAAttnBackend.
 
-    slopes = torch.tensor(get_slopes(nheads))  # (nheads,)
-    return slopes
+    This is a wrapper that prepares inputs for the backend and handles
+    the QKV projection, normalization, RoPE, and output processing,
+    while delegating the Simple GLA kernel calls to SimpleGLAAttnBackend.
+    """
 
-class MiniCPMLightningAttention(nn.Module):
     def __init__(
         self,
         hidden_size: int,
@@ -233,7 +222,7 @@ class MiniCPMLightningAttention(nn.Module):
         attention_bias: bool = False,
         rms_norm_eps: float = 1e-6,
         use_output_norm: bool = False,
-        qk_norm : bool = True,
+        qk_norm: bool = True,
         rope_head_dim: Optional[int] = None,
         scale: str = '1/sqrt(d)',
     ) -> None:
@@ -245,12 +234,8 @@ class MiniCPMLightningAttention(nn.Module):
         self.num_heads = self.total_num_heads // tp_size
         self.total_num_kv_heads = num_kv_heads
         if self.total_num_kv_heads >= tp_size:
-            # Number of KV heads is greater than TP size, so we partition
-            # the KV heads across multiple tensor parallel GPUs.
             assert self.total_num_kv_heads % tp_size == 0
         else:
-            # Number of KV heads is less than TP size, so we replicate
-            # the KV heads across multiple tensor parallel GPUs.
             assert tp_size % self.total_num_kv_heads == 0
         self.num_kv_heads = max(1, self.total_num_kv_heads // tp_size)
         self.head_dim = head_dim
@@ -260,7 +245,6 @@ class MiniCPMLightningAttention(nn.Module):
             self.scale = self.head_dim ** (-1.0)
         else:
             self.scale = 1.0
-        self.is_causal = True
         self.use_output_gate = use_output_gate
         self.attention_bias = attention_bias
         self.rms_norm_eps = rms_norm_eps
@@ -284,6 +268,7 @@ class MiniCPMLightningAttention(nn.Module):
             quant_config=quant_config,
             prefix=add_prefix("qkv_proj", prefix),
         )
+        
         self.o_proj = RowParallelLinear(
             self.total_num_heads * self.head_dim,
             hidden_size,
@@ -291,6 +276,7 @@ class MiniCPMLightningAttention(nn.Module):
             quant_config=quant_config,
             prefix=add_prefix("o_proj", prefix),
         )
+        
         if self.use_output_norm:
             self.o_norm = RMSNorm(
                 self.num_heads * self.head_dim, eps=self.rms_norm_eps
@@ -318,69 +304,18 @@ class MiniCPMLightningAttention(nn.Module):
                 rope_scaling=rope_scaling,
             )
 
-        self.s = (
-            _build_slope_tensor(self.num_heads).to(dtype=torch.float32)
-            * (-1.0)
-        )  # (h)
-
         self.layer_id = layer_id
+        self.state_shape = (self.num_kv_heads, self.head_dim, self.head_dim)
 
-    def attn_fn(
-        self,
-        q: torch.Tensor,  # (b, t, h, d)
-        k: torch.Tensor,  # (b, t, h, d)
-        v: torch.Tensor,  # (b, t, h, d)
-        decay: torch.Tensor,  # (h,)
-        forward_batch: ForwardBatch,
-        scale: float | None = None,  # will use dk^(-1) if None.
-        initial_state: torch.Tensor | None = None,  # (b, h, dk, dv)
-        mode: str = 'chunk',
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        if forward_batch.forward_mode.is_decode():
-            seqlen = 1
-            cu_seqlens = torch.arange(forward_batch.batch_size + 1, dtype=torch.int32, device=q.device)
-        else:
-            seqlen = torch.max(forward_batch.extend_seq_lens)
-            cu_seqlens = F.pad(forward_batch.extend_seq_lens.cumsum(dim=0), (1, 0))
-        mode = "fused_recurrent" if seqlen < 64 else "chunk"
-        if mode == "chunk":
-            o, final_state = chunk_simple_gla(
-                q=q.unsqueeze(0),
-                k=k.unsqueeze(0),
-                v=v.unsqueeze(0),
-                g_gamma=decay,  # (h,)
-                initial_state=initial_state,
-                output_final_state=True,
-                scale=scale,
-                head_first=False,
-                cu_seqlens=cu_seqlens
-            )  # (b, t, h, d)
-        elif mode == "fused_recurrent":
-            o, final_state = fused_recurrent_simple_gla(
-                q=q.unsqueeze(0),
-                k=k.unsqueeze(0),
-                v=v.unsqueeze(0),
-                g_gamma=decay,
-                scale=scale,
-                initial_state=initial_state,
-                output_final_state=True,
-                # reverse=reverse,
-                cu_seqlens=cu_seqlens,
-                # head_first=False,
-            )
-        else:
-            raise ValueError(f"Invalid mode: {mode}")
-        return o, final_state
-    
     def forward(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
-    ) -> torch.Tensor:  
+    ) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-     
+
         if self.qk_norm:
             q = self.q_norm(q.reshape(-1, self.head_dim))
             k = self.k_norm(k.reshape(-1, self.head_dim))
@@ -397,21 +332,40 @@ class MiniCPMLightningAttention(nn.Module):
         k = k.reshape(-1, self.num_kv_heads, self.head_dim)
         v = v.reshape(-1, self.num_kv_heads, self.head_dim)
 
-        #[TODO] load state
+        # ALWAYS unsqueeze to (1, total_tokens, h, d)
+        q = q.unsqueeze(0)  # (1, total_tokens, num_heads, head_dim)
+        k = k.unsqueeze(0)
+        v = v.unsqueeze(0)
 
-        o, final_state = self.attn_fn(
+        # Get backend from forward batch
+        attn_backend = forward_batch.attn_backend
+        if not hasattr(attn_backend, 'linear_attn_backend'):
+            raise RuntimeError(
+                "SimpleGLAAttnBackend requires HybridLinearAttnBackend but got "
+                f"{type(attn_backend).__name__}. This mixer should only be used for "
+                "MiniCPM hybrid models."
+            )
+        
+        linear_attn_backend = attn_backend.linear_attn_backend
+        if not isinstance(linear_attn_backend, SimpleGLAAttnBackend):
+            raise RuntimeError(
+                f"Expected SimpleGLAAttnBackend but got {type(linear_attn_backend).__name__}"
+            )
+
+        # Prepare backend inputs
+        # Backend expects q, k, v, forward_batch, layer_id
+        # It will handle state loading/saving internally
+        o = linear_attn_backend.forward(
             q=q,
             k=k,
             v=v,
-            decay=self.s,
             forward_batch=forward_batch,
-            initial_state=None,
-            scale=self.scale,
+            layer_id=self.layer_id,
+            output_attentions=False,
         )
 
-        #[TODO] write state
-
         o = o.reshape(-1, self.num_heads * self.head_dim)
+        
         if self.use_output_norm:
             o = self.o_norm(o)
 
@@ -459,7 +413,7 @@ class MiniCPMDecoderLayer(nn.Module):
             assert (
                 config.head_dim is not False
             ), "head_dim must be provided for LightningAttention"
-            self.self_attn = MiniCPMLightningAttention(
+            self.self_attn = MiniCPMLightningMixer(
                 hidden_size=self.hidden_size,
                 num_heads=config.lightning_nh,
                 num_kv_heads=config.lightning_nkv,
