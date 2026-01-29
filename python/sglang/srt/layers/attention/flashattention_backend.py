@@ -1915,6 +1915,10 @@ class FlashAttentionBackend(AttentionBackend):
                     -1, layer.tp_q_head_num, layer.head_dim
                 )
                 
+                if layer.layer_id == 0 and forward_batch.seq_lens_cpu[0] == 256 * 1024 + 1:
+                    torch.cuda.synchronize()
+                    torch.cuda.cudart().cudaProfilerStart()
+                
                 # if layer.layer_id == 0 and forward_batch.seq_lens_cpu[0] == 8193:
                 #     print("profile start")
                 #     torch.cuda.synchronize()
@@ -2031,6 +2035,10 @@ class FlashAttentionBackend(AttentionBackend):
                     num_splits=self.num_splits,
                     **kwargs,
                 )
+                
+                if layer.layer_id == 0 and forward_batch.seq_lens_cpu[0] == 256 * 1024 + 1:
+                    torch.cuda.synchronize()
+                    torch.cuda.cudart().cudaProfilerStop()
 
                 # # Default: single-token self-attention
                 # result = flash_attn_with_kvcache(
