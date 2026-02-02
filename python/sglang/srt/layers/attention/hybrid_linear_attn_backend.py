@@ -490,6 +490,7 @@ class MambaAttnBackendBase(AttentionBackend):
             dtype=torch.int32,
             device=self.device,
         )
+        # self.state = torch.zeros((1, total_num_heads, head_dim, head_dim), dtype=torch.bfloat16, device=self.device)
 
     def _capture_metadata(
         self,
@@ -1483,6 +1484,7 @@ class SimpleGLAAttnBackend(MambaAttnBackendBase):
                 "Simple GLA backend requested but the 'fla' package is not installed. "
                 "Install it or configure the model to use a supported attention backend (e.g., Mamba2)."
             )
+        self.state = torch.zeros((4, total_num_heads, head_dim, head_dim), dtype=torch.bfloat16, device=self.device)
 
     def _get_mamba_indices(self, forward_batch: ForwardBatch) -> torch.Tensor:
         """Get mamba cache indices with fallback logic.
@@ -1559,17 +1561,26 @@ class SimpleGLAAttnBackend(MambaAttnBackendBase):
         layer_id: int,
         output_attentions: bool = False,
     ) -> torch.Tensor:
-        batch_size, seq_len, num_heads, head_dim = q.shape
-        dtype = q.dtype
+
+        num_heads = q.shape[2]
+        head_dim = q.shape[3]
+        batch_size = forward_batch.batch_size
+        if forward_batch.forward_mode.is_decode():
+            seq_len = 1
+        else:
+            seq_len = torch.max(forward_batch.extend_seq_lens)
 
         mamba_indices = self._get_mamba_indices(forward_batch)
-
         initial_state = None
-        if forward_batch.forward_mode.is_decode():
+        has_initial_state = forward_batch.forward_mode.is_decode() or forward_batch.extend_prefix_lens > 0
+        
+        # if forward_batch.forward_mode.is_decode():
+        if has_initial_state:
             cache_idx = self.req_to_token_pool.mamba_map.get(layer_id)
             if cache_idx is not None:
                 layer_cache = self.req_to_token_pool.mamba_pool.mamba2_layer_cache(cache_idx)
                 initial_state = layer_cache.temporal[mamba_indices, :].contiguous()
+                self.state[:batch_size].copy_(layer_cache.temporal[mamba_indices, :])
             else:
                 raise RuntimeError(
                     f"SimpleGLAAttnBackend layer {layer_id} is missing from mamba_map. "
@@ -1581,35 +1592,18 @@ class SimpleGLAAttnBackend(MambaAttnBackendBase):
 
         g_gamma = self.g_gamma
 
-        # Compute cu_seqlens for all modes (CUDA graph compatible)
-        # Use extend_seq_lens if available, otherwise use seq_lens (decode mode)
-        import torch.nn.functional as F
-        if forward_batch.extend_seq_lens is not None:
-            # Prefill/extend mode: actual sequence lengths
-            seq_lens_for_cu = forward_batch.extend_seq_lens
-        else:
-            # Decode mode: each request generates 1 token, so use seq_lens
-            # seq_lens represents total sequence length, but we need extend (1 token per request)
-            # So we create a tensor of 1s with shape (batch_size,)
-            seq_lens_for_cu = torch.ones(
-                forward_batch.batch_size,
-                dtype=torch.int32,
-                device=q.device
-            )
-
-        # Compute cu_seqlens: [0, seq1, seq1+seq2, ...]
-        cu_seqlens = F.pad(seq_lens_for_cu.cumsum(dim=0), (1, 0))
-
-        if seq_len < 64:
+        mode = "fused_recurrent" if seq_len < 64 else "chunk"
+        # if forward_batch.forward_mode.is_decode() or mode == "fused_recurrent":
+        if forward_batch.forward_mode.is_decode() or mode == "fused_recurrent":
             o, final_state = fused_recurrent_simple_gla(
                 q=q,
                 k=k,
                 v=v,
                 g_gamma=g_gamma,
                 scale=scale,
-                initial_state=initial_state,
+                initial_state=self.state[:batch_size] if has_initial_state else None,
                 output_final_state=True,
-                cu_seqlens=cu_seqlens,
+                cu_seqlens=self.forward_metadata.query_start_loc,
             )
         else:
             o, final_state = chunk_simple_gla(
@@ -1620,9 +1614,54 @@ class SimpleGLAAttnBackend(MambaAttnBackendBase):
                 initial_state=initial_state,
                 output_final_state=True,
                 scale=scale,
-                head_first=False,
-                cu_seqlens=cu_seqlens,
+                cu_seqlens=self.forward_metadata.query_start_loc,
             )
+        # if mode == "chunk" and :
+        #     o, final_state = chunk_simple_gla(
+        #         q=q,
+        #         k=k,
+        #         v=v,
+        #         g_gamma=g_gamma,
+        #         scale=scale,
+        #         initial_state=initial_state,
+        #         output_final_state=True,
+        #         scale=scale,
+        #         head_first=False,
+        #         cu_seqlens=cu_seqlens
+        #     )  # (b, t, h, d)
+        #     o, final_state = fused_recurrent_simple_gla(
+        #         q=q,
+        #         k=k,
+        #         v=v,
+        #         g_gamma=g_gamma,
+        #         scale=scale,
+        #         initial_state=self.state[:batch_size],
+        #         output_final_state=True,
+        #         cu_seqlens=self.forward_metadata.query_start_loc,
+        #         # cu_seqlens=self.cu_seqlens[:batch_size+1],
+        #     )
+        # else:
+        #     o, final_state = fused_recurrent_simple_gla(
+        #         q=q,
+        #         k=k,
+        #         v=v,
+        #         g_gamma=g_gamma,
+        #         scale=scale,
+        #         initial_state=None,
+        #         output_final_state=True,
+        #         cu_seqlens=self.forward_metadata.query_start_loc,
+        #     )
+        #     # o, final_state = chunk_simple_gla(
+        #     #     q=q,
+        #     #     k=k,
+        #     #     v=v,
+        #     #     g_gamma=g_gamma,
+        #     #     initial_state=self.state,
+        #     #     output_final_state=True,
+        #     #     scale=scale,
+        #     #     head_first=False,
+        #     #     cu_seqlens=cu_seqlens,
+        #     # )
 
         if final_state is not None:
             mamba_indices = self._get_mamba_indices(forward_batch)

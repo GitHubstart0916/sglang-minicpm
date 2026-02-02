@@ -1493,7 +1493,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
     @property
     def minicpm_hybrid_config(self):
         config = self.model_config.hf_config
-        if isinstance(config, MiniCPMHybridConfig):
+        if isinstance(config, MiniCPMHybridConfig) and config.mixer_types is not None:
             return config
         return None
 

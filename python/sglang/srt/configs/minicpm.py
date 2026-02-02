@@ -94,7 +94,7 @@ class MiniCPMHybridConfig(PretrainedConfig):
         self.rms_norm_eps = rms_norm_eps
         self.use_cache = use_cache
         # Hybrid config fields
-        self.mixer_types = mixer_types if mixer_types is not None else []
+        self.mixer_types = mixer_types if mixer_types is not None else None
         self.minicpm4 = minicpm4
         self.lightning = lightning
         self.lightning_nh = lightning_nh
@@ -106,10 +106,13 @@ class MiniCPMHybridConfig(PretrainedConfig):
         """Return Simple GLA cache parameters for lightning attention layers."""
         from sglang.srt.layers.dp_attention import get_attention_tp_size
 
-        lightning_layer_ids = [
-            i for i, mixer_type in enumerate(self.mixer_types)
-            if mixer_type in ["lightning", "lightning_attn", "lightning-attn"]
-        ]
+        if self.mixer_types is None:
+            lightning_layer_ids = []
+        else:
+            lightning_layer_ids = [
+                i for i, mixer_type in enumerate(self.mixer_types)
+                if mixer_type in ["lightning", "lightning_attn", "lightning-attn"]
+            ]
 
         if not lightning_layer_ids or not self.lightning_nkv or not self.lightning_head_dim:
             return None
@@ -125,7 +128,10 @@ class MiniCPMHybridConfig(PretrainedConfig):
 
     @property
     def full_attention_layer_ids(self):
-        return [
-            i for i, mixer_type in enumerate(self.mixer_types)
-            if mixer_type in ["minicpm4", "minicpm", "standard", "attention", "attn"]
-        ]
+        if self.mixer_types is None:
+            return list(range(self.num_hidden_layers))
+        else:
+            return [
+                i for i, mixer_type in enumerate(self.mixer_types)
+                if mixer_type in ["minicpm4", "minicpm", "standard", "attention", "attn"]
+            ]
