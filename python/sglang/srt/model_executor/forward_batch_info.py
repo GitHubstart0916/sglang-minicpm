@@ -447,6 +447,8 @@ class ForwardBatch:
     total_compress_k2_token_nums_cpu: Optional[torch.Tensor] = None
     cu_total_compress_k2_token_nums_cpu: Optional[torch.Tensor] = None
 
+    cache_seqlens_int32_stage1_cpu: Optional[torch.Tensor] = None
+    
     @classmethod
     def init_new(
         cls,
@@ -513,6 +515,7 @@ class ForwardBatch:
             cu_new_compress_k2_token_nums_cpu=batch.cu_new_compress_k2_token_nums_cpu,
             total_compress_k2_token_nums_cpu=batch.total_compress_k2_token_nums_cpu,
             cu_total_compress_k2_token_nums_cpu=batch.cu_total_compress_k2_token_nums_cpu,
+            cache_seqlens_int32_stage1_cpu=batch.cache_seqlens_int32_stage1_cpu,
         )
         device = model_runner.device
 

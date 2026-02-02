@@ -136,6 +136,11 @@ class FlashAttentionMetadata:
     old_bs_to_new_bs_range = None
     sparse_cu_seqlens_q_cpu = None
     
+    # use in stage1
+    cu_seqlens_q_adjusted: Optional[torch.Tensor] = None
+    max_seqlen_q_adjusted: Optional[int] = None
+    cache_seqlens_int32_stage1: torch.Tensor = None
+    
     
 
     @dataclass
@@ -386,6 +391,8 @@ def compressed_attention(
     local_blocks: int = 2,
     cache_lens=None,
     total_q: int = -1,
+    cu_seqlens_q_adjusted: Optional[torch.Tensor] = None,
+    max_seqlen_q_adjusted: Optional[int] = None,
     # block_score_buffer: torch.Tensor = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     with torch.no_grad():
@@ -404,13 +411,14 @@ def compressed_attention(
             # Calculate q_idx for each query position in each batch
             if cache_lens is None:
                 cache_lens = torch.zeros(batch_size, dtype=torch.int32, device=q.device) 
-            q_idx = torch.cat([
-                (torch.arange(cu_seqlens_q[i + 1] - cu_seqlens_q[i], device=q.device) + cache_lens[i]) // block_size
-                for i in range(batch_size)
-            ], dim=0)  # shape: [total_q_len]
+            # q_idx = torch.cat([
+            #     (torch.arange(cu_seqlens_q[i + 1] - cu_seqlens_q[i], device=q.device) + cache_lens[i]) // block_size
+            #     for i in range(batch_size)
+            # ], dim=0)  # shape: [total_q_len]
         else:  # decoding stage
             # Each batch has only one query (last position)
-            q_idx = cache_lens // block_size  # shape: [batch_size] = [total_q_len] in decoding
+            # q_idx = cache_lens // block_size  # shape: [batch_size] = [total_q_len] in decoding
+            pass
 
         # compressed_k1,k2 alloc一块固定位置的buffer, cu_seqlens_k要在capture的时候给个合适的值
         # 修改压缩算子直接写这个buffer
@@ -426,10 +434,10 @@ def compressed_attention(
             q.contiguous(),
             k.contiguous(),
             k2.contiguous(),
-            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_q=cu_seqlens_q_adjusted,
             cu_seqlens_k=cu_seqlens_k,
             cu_seqlens_v=cu_seqlens_k2,
-            max_seqlen_q=max_seqlen_q,
+            max_seqlen_q=max_seqlen_q_adjusted,
             # max_seqlen_k=max_seqlen_k,
             causal=is_prefilling
         )
@@ -460,7 +468,7 @@ def compressed_attention(
         # get topk
         # topk = min(topk, block_score.shape[-1])
         topk_idx = block_score.topk(topk, dim=-1).indices.sort(-1).values
-        topk_idx[topk_idx > q_idx[None, :, None]] = -1
+        # topk_idx[topk_idx > q_idx[None, :, None]] = -1
         topk_idx = topk_idx.to(torch.int32)
         # topk_idx = torch.zeros((2,1,96), dtype=torch.int32, device="cuda")  # TODO: remove this line
 
@@ -580,9 +588,10 @@ class FlashAttentionBackend(AttentionBackend):
             self.compress_k2 = CompressK(self.num_kv_heads, model_runner.model_config.hidden_size // model_runner.model_config.num_attention_heads, kernel_size=self.kernel_size*4, kernel_stride=self.kernel_stride*4)
      
             # TODO: sync with sparse config 
-            self.head_group_num = 2 # k_head_num
+            self.head_group_num = model_runner.model_config.num_key_value_heads  # k_head_num
+            self.heads_per_group = model_runner.model_config.num_attention_heads // self.head_group_num
             self.head_dim = model_runner.model_config.head_dim
-            print("head dim is {}".format(self.head_dim))
+            print("head_group_num is {}, heads_per_group is {}, head dim is {}".format(self.head_group_num, self.heads_per_group, self.head_dim))
             self.k1_kernel_size = self.kernel_size
             self.k1_kernel_stride = self.kernel_stride
             
@@ -651,6 +660,9 @@ class FlashAttentionBackend(AttentionBackend):
         metadata.cu_total_compress_k1_token_nums = F.pad(torch.cumsum(metadata.total_compress_k1_token_nums, dim=0, dtype=torch.int32), (1, 0))
         metadata.cu_total_compress_k2_token_nums = F.pad(torch.cumsum(metadata.total_compress_k2_token_nums, dim=0, dtype=torch.int32), (1, 0))
         
+        metadata.cu_seqlens_q_adjusted = metadata.cu_seqlens_q * self.heads_per_group
+        metadata.max_seqlen_q_adjusted = metadata.max_seq_len_q * self.heads_per_group
+        metadata.cache_seqlens_int32_stage1 = metadata.cache_seqlens_int32 - 1
           
         if forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed():
             bs = forward_batch.batch_size
@@ -1280,9 +1292,18 @@ class FlashAttentionBackend(AttentionBackend):
         # compressed_seqlens = compressed_cu_seqlens[1:] - compressed_cu_seqlens[:-1]
         cache_lens = None
         if max_seqlen_in_batch_k > max_seqlen_in_batch_q:
-            seq_lens_k = cu_seqlens_k[1:] - cu_seqlens_k[:-1]
-            seq_lens_q = cu_seqlens_q[1:] - cu_seqlens_q[:-1]
-            cache_lens = seq_lens_k - seq_lens_q
+            if max_seqlen_in_batch_q == 1:
+                cache_lens = self.forward_metadata.cache_seqlens_int32_stage1
+            else:
+                seq_lens_k = cu_seqlens_k[1:] - cu_seqlens_k[:-1]
+                seq_lens_q = cu_seqlens_q[1:] - cu_seqlens_q[:-1]
+                cache_lens = seq_lens_k - seq_lens_q
+            # cache_lens = self.forward_metadata.cache_seqlens_int32_stage1
+            # if not torch.allclose(cache_lens, self.forward_metadata.cache_seqlens_int32_stage1):
+            #     print("cache_lens is not equal to metadata.cache_seqlens_int32_stage1")
+
+        # print("cache_lens is {}".format(cache_lens))
+        # print("metadata.cache_lens is {}".format(self.forward_metadata.cache_seqlens_int32))
 
         topk_idx = compressed_attention(
             query_layer if no_rope_param is None else no_rope_param['query_states_no_rope'],
@@ -1301,6 +1322,8 @@ class FlashAttentionBackend(AttentionBackend):
             init_blocks=self.init_blocks,
             local_blocks=self.local_blocks,
             cache_lens=cache_lens,
+            cu_seqlens_q_adjusted=self.forward_metadata.cu_seqlens_q_adjusted,
+            max_seqlen_q_adjusted=self.forward_metadata.max_seqlen_q_adjusted,
             # block_score_buffer=self.forward_metadata.block_score_buffer
         )
 
@@ -1923,7 +1946,7 @@ class FlashAttentionBackend(AttentionBackend):
                                                     forward_batch,
                                                     False)
                 # topk_idx = self.mock_topks[layer.layer_id]
-                sparse_page_table = sparse_kernel_extension.get_block_table_v2(
+                sparse_page_table = sparse_kernel_extension.get_block_table_v3(
                             topk_idx,
                             page_table,
                             metadata.token_to_bs,
@@ -2283,6 +2306,12 @@ class FlashAttentionBackend(AttentionBackend):
             ),
             "cu_total_compress_k2_token_nums": torch.zeros(
                 max_bs + 1, dtype=torch.int32, device=self.device
+            ),
+            "cu_seqlens_q_adjusted": torch.arange(
+                0, max_bs + 1, dtype=torch.int32, device=self.device
+            ) * self.heads_per_group,
+            "cache_seqlens_int32_stage1": torch.zeros(
+                max_bs, dtype=torch.int32, device=self.device
             ),
             } if self.is_sparse_minicpm else {}), 
         }
@@ -2755,6 +2784,16 @@ class FlashAttentionBackend(AttentionBackend):
                     metadata.k2_table = self.decode_cuda_graph_metadata["k2_table"][
                         :bs, :
                     ]
+                    
+                    metadata.cu_seqlens_q_adjusted = self.decode_cuda_graph_metadata[
+                        "cu_seqlens_q_adjusted"
+                    ][: batch_size + 1]
+                    metadata.cache_seqlens_int32_stage1 = self.decode_cuda_graph_metadata[
+                        "cache_seqlens_int32_stage1"
+                    ][: batch_size]
+                    
+                    # decode
+                    metadata.max_seqlen_q_adjusted = self.heads_per_group
                 
                 self.decode_cuda_graph_metadata[bs] = metadata
 
@@ -3114,6 +3153,8 @@ class FlashAttentionBackend(AttentionBackend):
                     
                     metadata.k1_table.copy_(self.req_to_sparse_k1_token[req_pool_indices])
                     metadata.k2_table.copy_(self.req_to_sparse_k2_token[req_pool_indices])
+                    
+                    metadata.cache_seqlens_int32_stage1[: real_bs].copy_(forward_batch.cache_seqlens_int32_stage1_cpu)
                     
                     # torch.cuda.synchronize()
                     # end = time.perf_counter()
