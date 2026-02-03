@@ -528,6 +528,7 @@ class ServerArgs:
     cuda_graph_bs: Optional[List[int]] = None
     disable_cuda_graph: bool = False
     disable_cuda_graph_padding: bool = False
+    fuse_topk: bool = False
     enable_profile_cuda_graph: bool = False
     enable_cudagraph_gc: bool = False
     enable_layerwise_nvtx_marker: bool = False
@@ -3991,6 +3992,11 @@ class ServerArgs:
             "--disable-cuda-graph-padding",
             action="store_true",
             help="Disable cuda graph when padding is needed. Still uses cuda graph when padding is not needed.",
+        )
+        parser.add_argument(
+            "--fuse-topk",
+            action="store_true",
+            help="fuse stage1+maxpool+topk in minicpm into a single kernel",
         )
         parser.add_argument(
             "--enable-profile-cuda-graph",

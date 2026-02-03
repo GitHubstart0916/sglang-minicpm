@@ -34,6 +34,11 @@ from infllm_v2 import (
 from sglang.srt.layers.attention.sparse_utils import CompressK, get_compress_k, get_compress_k_v2, batched_gather
 import sparse_kernel_extension
 import torch.nn.functional as F
+from sglang.srt.layers.attention.minicpm_fuse_kernel import fused_attn_pooling_online_topk_prefill, fused_attn_pooling_online_topk_decode, _bucket_size
+import tilelang
+import tilelang.language as T
+import tilelang.math
+import math
 
 @dataclass
 class FlashAttentionMetadata:
@@ -139,6 +144,9 @@ class FlashAttentionMetadata:
     cu_seqlens_q_adjusted: Optional[torch.Tensor] = None
     max_seqlen_q_adjusted: Optional[int] = None
     cache_seqlens_int32_stage1: torch.Tensor = None
+    
+    # 
+    # decode_fused_kernel = None
     
     
 
@@ -385,6 +393,7 @@ def compressed_attention(
     cu_seqlens_k2: torch.Tensor,
     max_seqlen_q: int,
     max_seqlen_k: int,
+    max_context_len: int,
     sm_scale: float = None,
     init_blocks: int = 1,
     local_blocks: int = 2,
@@ -431,7 +440,7 @@ def compressed_attention(
             cu_seqlens_k=cu_seqlens_k,
             cu_seqlens_v=cu_seqlens_k2,
             max_seqlen_q=max_seqlen_q_adjusted,
-            # max_seqlen_k=max_seqlen_k,
+            max_seqlen_k=max_seqlen_k,
             causal=is_prefilling
         )
         
@@ -445,7 +454,8 @@ def compressed_attention(
             cu_seqlens_k,
             cache_lens,
             max_seqlen_q,
-            # max_seqlen_k,
+            max_seqlen_k,
+            max_context_len,
             local_blocks=local_blocks,
             init_blocks=init_blocks,
             block_size=block_size,
@@ -466,6 +476,188 @@ def compressed_attention(
         # topk_idx = torch.zeros((2,1,96), dtype=torch.int32, device="cuda")  # TODO: remove this line
 
     return topk_idx
+
+def compressed_attention_tilelang(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    k2: torch.Tensor,
+    kernel_size: int,
+    kernel_stride: int,
+    block_size: int,
+    topk: int,
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_k: torch.Tensor,
+    cu_seqlens_k2: torch.Tensor,
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    sm_scale: float = None,
+    init_blocks: int = 1,
+    local_blocks: int = 2,
+    cache_lens=None,
+    decode_fused_kernel=None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    使用 tilelang online topk kernel 计算 compressed attention topk indices
+    """
+    with torch.no_grad():
+        batch_size = cu_seqlens_q.shape[0] - 1
+        
+        # Check if it's prefilling stage
+        # Use max_seqlen_q > 1 to avoid .item() call for CUDA Graph compatibility
+        is_prefilling = cache_lens is None or max_seqlen_q > 1
+        
+        # Fixed max_cache_len for CUDA Graph compatibility (avoid .item() calls)
+        max_cache_len = 32768  # 512k
+
+        # Get tensor dimensions
+        # q shape: [total_q_len, num_kv_heads, groups, head_dim] or [total_q_len, num_heads, head_dim]
+        # k shape: [total_k_len, num_kv_heads, head_dim]
+        total_q_len = q.shape[0]
+        total_k_len = k.shape[0]
+        num_kv_heads = k.shape[1]
+        head_dim = k.shape[2]
+        
+        # Determine num_heads and groups
+        # if q.dim() == 4:
+        #     groups = q.shape[2]
+        #     num_heads = num_kv_heads * groups
+        #     # Reshape q from [total_q_len, num_kv_heads, groups, head_dim] to [total_q_len * groups, num_kv_heads, head_dim]
+        #     q_kernel = q.transpose(1, 2).reshape(total_q_len * groups, num_kv_heads, head_dim).contiguous()
+        # else:
+        num_heads = q.shape[1]
+        groups = num_heads // num_kv_heads
+        # q shape: [total_q_len, num_heads, head_dim]
+        # Need to reshape to [total_q_len * groups, num_kv_heads, head_dim]
+        q_kernel = q.view(total_q_len, num_kv_heads, groups, head_dim)
+        q_kernel = q_kernel.transpose(1, 2).reshape(total_q_len * groups, num_kv_heads, head_dim).contiguous()
+        
+        k_kernel = k.contiguous()
+        
+        # Compute pooled_k_len using infllmv2 formula (based on block count):
+        # total_len = max_seqlen_q + cache_len
+        # out_len = (total_len + block_size - 1) // block_size
+        if is_prefilling:
+            # Prefill: use the actual max_seqlen_q
+            total_len = max_seqlen_q
+            pooled_k_len = (total_len + block_size - 1) // block_size
+        else:
+            # Decode: use fixed max_cache_len for CUDA Graph compatibility
+            # Kernel uses actual_pooled_k_len internally for dynamic bounds checking
+            pooled_k_len = (max_cache_len + block_size - 1) // block_size
+            assert decode_fused_kernel is not None, "decode_fused_kernel is not initialized"
+        
+        
+        # Pooling parameters - aligned with infllmv2_cuda_impl:
+        # block_stride = block_size // kernel_stride = 64 // 16 = 4
+        # pad_len = kernel_size // kernel_stride - 1 = 32 // 16 - 1 = 1
+        # num_offs = kernel_size // kernel_stride + block_size // kernel_stride - 1 = 2 + 4 - 1 = 5
+        pooling_block_stride = block_size // kernel_stride  # = 64 // 16 = 4
+        pooling_pad_len = kernel_size // kernel_stride - 1  # = 32 // 16 - 1 = 1
+        pooling_num_offs = kernel_size // kernel_stride + block_size // kernel_stride - 1  # = 2 + 4 - 1 = 5
+        
+        # Compute actual output topk (same as original: min(topk, num_blocks))
+        output_topk = min(topk, pooled_k_len)
+        
+        # For the kernel, we need power of 2 topk
+        topk_power2 = tilelang.math.next_power_of_2(output_topk)
+        kernel_topk = min(topk_power2, pooled_k_len)
+        # Make sure it's still power of 2
+        if kernel_topk != tilelang.math.next_power_of_2(kernel_topk):
+            kernel_topk = tilelang.math.next_power_of_2(kernel_topk) // 2
+        kernel_topk = max(8, kernel_topk)  # Minimum topk for kernel
+        
+        # Determine dtype string
+        if q.dtype == torch.float16:
+            dtype_str = "float16"
+        elif q.dtype == torch.bfloat16:
+            dtype_str = "bfloat16"
+        else:
+            dtype_str = "bfloat16"
+        
+        # Allocate output tensors
+        topk_indices = torch.full((num_kv_heads, total_q_len, kernel_topk), -1, dtype=torch.int32, device=q.device)
+        topk_values = torch.full((num_kv_heads, total_q_len, kernel_topk), float('-inf'), dtype=torch.float32, device=q.device)
+        
+        if is_prefilling:
+            # =================================================================
+            # PREFILL: Use bucketed max_seqlen_q and pooled_k_len
+            # Compiles once per unique bucket combination
+            # =================================================================
+            bucketed_max_seqlen_q = _bucket_size(max_seqlen_q)
+            bucketed_pooled_k_len = _bucket_size(pooled_k_len)
+            # Also bucket actual_max_seqlen_q/k to reduce kernel recompilation
+            bucketed_actual_max_seqlen_q = _bucket_size(max_seqlen_q)
+            bucketed_actual_max_seqlen_k = _bucket_size(max_seqlen_k)
+            
+            kernel = fused_attn_pooling_online_topk_prefill(
+                batch_size=batch_size,
+                groups=groups,
+                heads=num_heads,
+                dim=head_dim,
+                topk=kernel_topk,
+                max_seqlen_q_grid=bucketed_max_seqlen_q,  # Bucketed for grid
+                pooled_k_len=bucketed_pooled_k_len,
+                actual_max_seqlen_q=bucketed_actual_max_seqlen_q,  # Bucketed for causal mask
+                actual_max_seqlen_k=bucketed_actual_max_seqlen_k,  # Bucketed for causal mask
+                m_block_dim=16,
+                block_stride=pooling_block_stride,
+                pad_len=pooling_pad_len,
+                num_offs=pooling_num_offs,
+                block_size=block_size,
+                init_blocks=init_blocks,
+                local_blocks=local_blocks,
+                dtype_str=dtype_str
+            )
+            
+            # Run prefill kernel (no cache_lens needed, it's always 0)
+            kernel(q_kernel, k_kernel, cu_seqlens_q, cu_seqlens_k, topk_indices, topk_values)
+        else:
+            # =================================================================
+            # DECODE: max_seqlen_q=1 (fixed), cache_lens passed as tensor
+            # Compiles ONCE and reuses for all decode steps!
+            # =================================================================
+            bucketed_pooled_k_len = _bucket_size(pooled_k_len)
+            
+            # Prepare cache_lens as tensor (runtime value, not compile-time constant!)
+            cache_lens_tensor = cache_lens.to(torch.int32)
+            
+            # kernel = fused_attn_pooling_online_topk_decode(
+            #     batch_size=batch_size,
+            #     groups=groups,
+            #     heads=num_heads,
+            #     dim=head_dim,
+            #     topk=kernel_topk,
+            #     pooled_k_len=bucketed_pooled_k_len,
+            #     m_block_dim=16,
+            #     block_stride=pooling_block_stride,
+            #     pad_len=pooling_pad_len,
+            #     num_offs=pooling_num_offs,
+            #     block_size=block_size,
+            #     init_blocks=init_blocks,
+            #     local_blocks=local_blocks,
+            #     dtype_str=dtype_str
+            # )
+            
+            # Run decode kernel with cache_lens as tensor
+            decode_fused_kernel(q_kernel, k_kernel, cu_seqlens_q, cu_seqlens_k, cache_lens_tensor, topk_indices, topk_values)
+        
+        # Note: q_idx masking is handled inside the kernel via causal_mask
+        # which sets scores to -1e9 for K blocks beyond the causal boundary.
+        # These blocks won't be selected in topk due to their low scores.
+        
+        # Sort with -1 values at the end (match original behavior)
+        # Replace -1 with large value, sort, then replace back
+        large_val = pooled_k_len + 1000  # Any value larger than max valid index
+        topk_for_sort = topk_indices.clone()
+        topk_for_sort[topk_for_sort == -1] = large_val
+        topk_idx = topk_for_sort.sort(-1).values
+        topk_idx[topk_idx == large_val] = -1
+        
+        # Truncate to output_topk (same as original: min(topk, num_blocks))
+        topk_idx = topk_idx[:, :, :output_topk]
+        
+        return topk_idx
+    
 
 class FlashAttentionBackend(AttentionBackend):
     """FlashAttention backend implementation.
@@ -588,7 +780,52 @@ class FlashAttentionBackend(AttentionBackend):
             
             self.k2_kernel_size = self.kernel_size * 4
             self.k2_kernel_stride = self.kernel_stride * 4
+            
+            self.fuse_topk = model_runner.server_args.fuse_topk
+            
+            
+            max_cache_len = self.max_context_len
+            pooled_k_len = (max_cache_len + self.block_size - 1) // self.block_size
+            
+            output_topk = min(self.sparse_topk, pooled_k_len)
+        
+            # For the kernel, we need power of 2 topk
+            topk_power2 = tilelang.math.next_power_of_2(output_topk)
+            kernel_topk = min(topk_power2, pooled_k_len)
+            # Make sure it's still power of 2
+            if kernel_topk != tilelang.math.next_power_of_2(kernel_topk):
+                kernel_topk = tilelang.math.next_power_of_2(kernel_topk) // 2
+            kernel_topk = max(8, kernel_topk)
+            # FIXME: Read from model config
+            dtype_str = "bfloat16"
+            self.decode_fused_kernels = {}
+            bucketed_pooled_k_len = _bucket_size(pooled_k_len)
+            
+            pooling_block_stride = self.block_size // self.kernel_stride  # = 64 // 16 = 4
+            pooling_pad_len = self.kernel_size // self.kernel_stride - 1  # = 32 // 16 - 1 = 1
+            pooling_num_offs = self.kernel_size // self.kernel_stride + self.block_size // self.kernel_stride - 1
 
+            if model_runner.server_args.fuse_topk:
+                print("jit start...")
+                for bs in range(1, model_runner.server_args.max_running_requests + 1):
+                    kernel = fused_attn_pooling_online_topk_decode(
+                        batch_size=bs,
+                        groups=self.heads_per_group,
+                        heads=model_runner.model_config.num_attention_heads,
+                        dim=self.head_dim,
+                        topk=kernel_topk,
+                        pooled_k_len=bucketed_pooled_k_len,
+                        m_block_dim=16,
+                        block_stride=pooling_block_stride,
+                        pad_len=pooling_pad_len,
+                        num_offs=pooling_num_offs,
+                        block_size=self.block_size,
+                        init_blocks=self.init_blocks,
+                        local_blocks=self.local_blocks,
+                        dtype_str=dtype_str
+                    )
+                    self.decode_fused_kernels[bs] = kernel
+                print("jit end...")
             # self.block_score_buffer = torch.zeros((self.head_group_num, self.max_context_len, self.max_context_len // self.block_size), dtype=torch.bfloat16, device="cuda")
 
     def update_batch_for_sparse(self, forward_batch: ForwardBatch, metadata: FlashAttentionMetadata):
@@ -600,12 +837,12 @@ class FlashAttentionBackend(AttentionBackend):
         seqlen_k2_cpu = torch.zeros((bs,), dtype=metadata.cu_seqlens_q.dtype, device='cpu')
         
         for i in range(bs):
-            if forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed():
-                seqlen_k1_cpu[i] = (forward_batch.extend_seq_lens_cpu[i] - self.k1_kernel_size) // self.k1_kernel_stride + 1 
-                seqlen_k2_cpu[i] = (forward_batch.extend_seq_lens_cpu[i] - self.k2_kernel_size) // self.k2_kernel_stride + 1
-            else:
-                seqlen_k1_cpu[i] = (forward_batch.seq_lens_cpu[i] - self.k1_kernel_size) // self.k1_kernel_stride + 1 
-                seqlen_k2_cpu[i] = (forward_batch.seq_lens_cpu[i] - self.k2_kernel_size) // self.k2_kernel_stride + 1
+            # if forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed():
+            #     seqlen_k1_cpu[i] = (forward_batch.extend_seq_lens_cpu[i] - self.k1_kernel_size) // self.k1_kernel_stride + 1 
+            #     seqlen_k2_cpu[i] = (forward_batch.extend_seq_lens_cpu[i] - self.k2_kernel_size) // self.k2_kernel_stride + 1
+            # else:
+            seqlen_k1_cpu[i] = (forward_batch.seq_lens_cpu[i] - self.k1_kernel_size) // self.k1_kernel_stride + 1 
+            seqlen_k2_cpu[i] = (forward_batch.seq_lens_cpu[i] - self.k2_kernel_size) // self.k2_kernel_stride + 1
 
             
         metadata.max_seq_len_k1 = seqlen_k1_cpu.max().item()
@@ -1101,7 +1338,8 @@ class FlashAttentionBackend(AttentionBackend):
         if is_prefill:
             
             bs, seqlens_q, seqlens_k = forward_batch.batch_size, forward_batch.extend_seq_lens_cpu, forward_batch.seq_lens_cpu
-
+            # if layer.layer_id == 0:
+            #     print("bs, seqlens_q, seq_lens_k is {} {} {}".format(bs, seqlens_q, seqlens_k))
             token_num_sparse_k1_total = [((seq_len - self.compress_k1.kernel_size) // self.compress_k1.kernel_stride + 1 if seq_len >= self.compress_k1.kernel_size else 0) for seq_len in forward_batch.seq_lens_cpu]
             k1_lens = torch.tensor(token_num_sparse_k1_total, dtype=torch.int64)
             token_num_sparse_k2_total = [((seq_len - self.compress_k2.kernel_size) // self.compress_k2.kernel_stride + 1 if seq_len >= self.compress_k2.kernel_size else 0) for seq_len in forward_batch.seq_lens_cpu]
@@ -1243,7 +1481,8 @@ class FlashAttentionBackend(AttentionBackend):
                             max_seqlen_in_batch_k,
                             no_rope_param=no_rope_param,
                             compressed_k=self.decode_cuda_graph_metadata["compress_k1"], compressed_cu_seqlens=metadata.cu_seqlens_k1,
-                            compressed_k2=self.decode_cuda_graph_metadata["compress_k2"], compressed_cu_seqlens2=metadata.cu_seqlens_k2
+                            compressed_k2=self.decode_cuda_graph_metadata["compress_k2"], compressed_cu_seqlens2=metadata.cu_seqlens_k2,
+                            decode_fused_kernel=self.decode_fused_kernels[forward_batch.batch_size] if self.fuse_topk else None
                 )
                 
             else:
@@ -1255,7 +1494,8 @@ class FlashAttentionBackend(AttentionBackend):
                             max_seqlen_in_batch_k,
                             no_rope_param=no_rope_param,
                             compressed_k=compressed_k, compressed_cu_seqlens=metadata.cu_seqlens_k1,
-                            compressed_k2=compressed_k2, compressed_cu_seqlens2=metadata.cu_seqlens_k2
+                            compressed_k2=compressed_k2, compressed_cu_seqlens2=metadata.cu_seqlens_k2,
+                            decode_fused_kernel=self.decode_fused_kernels[forward_batch.batch_size] if self.fuse_topk else None
                 )
 
         return ret
@@ -1269,7 +1509,8 @@ class FlashAttentionBackend(AttentionBackend):
                     #    max_seqlen_k1,
                        no_rope_param=None,
                        compressed_k=None, compressed_cu_seqlens=None,
-                       compressed_k2=None, compressed_cu_seqlens2=None):
+                       compressed_k2=None, compressed_cu_seqlens2=None,
+                       decode_fused_kernel=None):
         
         # compressed_seqlens = compressed_cu_seqlens[1:] - compressed_cu_seqlens[:-1]
         cache_lens = None
@@ -1286,28 +1527,49 @@ class FlashAttentionBackend(AttentionBackend):
 
         # print("cache_lens is {}".format(cache_lens))
         # print("metadata.cache_lens is {}".format(self.forward_metadata.cache_seqlens_int32))
-
-        topk_idx = compressed_attention(
-            query_layer if no_rope_param is None else no_rope_param['query_states_no_rope'],
-            compressed_k,
-            compressed_k2,
-            self.kernel_size,
-            self.kernel_stride,
-            self.block_size,
-            self.sparse_topk,
-            cu_seqlens_q,
-            compressed_cu_seqlens,
-            compressed_cu_seqlens2,
-            max_seqlen_in_batch_q,
-            self.forward_metadata.max_seq_len_k1,
-            None,
-            init_blocks=self.init_blocks,
-            local_blocks=self.local_blocks,
-            cache_lens=cache_lens,
-            cu_seqlens_q_adjusted=self.forward_metadata.cu_seqlens_q_adjusted,
-            max_seqlen_q_adjusted=self.forward_metadata.max_seqlen_q_adjusted,
-            # block_score_buffer=self.forward_metadata.block_score_buffer
-        )
+        if not self.fuse_topk:
+            topk_idx = compressed_attention(
+                query_layer if no_rope_param is None else no_rope_param['query_states_no_rope'],
+                compressed_k,
+                compressed_k2,
+                self.kernel_size,
+                self.kernel_stride,
+                self.block_size,
+                self.sparse_topk,
+                cu_seqlens_q,
+                compressed_cu_seqlens,
+                compressed_cu_seqlens2,
+                max_seqlen_in_batch_q,
+                self.max_context_len // self.kernel_size,
+                self.max_context_len,
+                None,
+                init_blocks=self.init_blocks,
+                local_blocks=self.local_blocks,
+                cache_lens=cache_lens,
+                cu_seqlens_q_adjusted=self.forward_metadata.cu_seqlens_q_adjusted,
+                max_seqlen_q_adjusted=self.forward_metadata.max_seqlen_q_adjusted,
+                # block_score_buffer=self.forward_metadata.block_score_buffer
+            )
+        else:
+            topk_idx = compressed_attention_tilelang(
+                query_layer if no_rope_param is None else no_rope_param['query_states_no_rope'],
+                compressed_k,
+                compressed_k2,
+                self.kernel_size,
+                self.kernel_stride,
+                self.block_size,
+                self.sparse_topk,
+                cu_seqlens_q,
+                compressed_cu_seqlens,
+                compressed_cu_seqlens2,
+                max_seqlen_in_batch_q,
+                self.forward_metadata.max_seq_len_k1,
+                None,
+                init_blocks=self.init_blocks,
+                local_blocks=self.local_blocks,
+                cache_lens=cache_lens,
+                decode_fused_kernel=decode_fused_kernel,
+            )
 
         return topk_idx
         
@@ -1441,12 +1703,13 @@ class FlashAttentionBackend(AttentionBackend):
 
             # assert topk_idx.shape[1] == metadata.seqlen_q_sparse_bs_tensor.sum().item(), "topk_idx[1] {} vs seqlen_q_as_param sum {}".format(
             #     topk_idx.shape[1], metadata.seqlen_q_sparse_bs_tensor.sum().item())
-            sparse_page_table_sparse_bs = sparse_kernel_extension.get_block_table_v2(
+            sparse_page_table_sparse_bs = sparse_kernel_extension.get_block_table_t_v2(
                 topk_idx,
                 page_table,
                 metadata.token_to_bs.to(topk_idx.device),
                 metadata.token_pos_in_bs.to(topk_idx.device),
-                metadata.seqlen_k_sparse_bs_tensor.to(topk_idx.device)
+                metadata.seqlen_k_sparse_bs_tensor.to(topk_idx.device),
+                self.sparse_topk
             ).reshape(-1, self.num_sparse_topk_tokens)
 
             # copy page table for sparse bs
@@ -1932,12 +2195,13 @@ class FlashAttentionBackend(AttentionBackend):
                                                     forward_batch,
                                                     False)
                 # topk_idx = self.mock_topks[layer.layer_id]
-                sparse_page_table = sparse_kernel_extension.get_block_table_v3(
+                sparse_page_table = sparse_kernel_extension.get_block_table_t_v3(
                             topk_idx,
                             page_table,
                             metadata.token_to_bs,
                             cache_seqlens,
-                            cache_seqlens
+                            cache_seqlens,
+                            self.sparse_topk
                 ).reshape(-1, self.num_sparse_topk_tokens)
                 
                 # if layer.layer_id == 0 and forward_batch.seq_lens_cpu[0] == 8193:
