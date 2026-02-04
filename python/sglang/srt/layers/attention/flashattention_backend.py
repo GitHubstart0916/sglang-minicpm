@@ -392,7 +392,7 @@ def compressed_attention(
     cu_seqlens_k: torch.Tensor,
     cu_seqlens_k2: torch.Tensor,
     max_seqlen_q: int,
-    max_seqlen_k: int,
+    # max_seqlen_k: int,
     max_context_len: int,
     sm_scale: float = None,
     init_blocks: int = 1,
@@ -440,7 +440,7 @@ def compressed_attention(
             cu_seqlens_k=cu_seqlens_k,
             cu_seqlens_v=cu_seqlens_k2,
             max_seqlen_q=max_seqlen_q_adjusted,
-            max_seqlen_k=max_seqlen_k,
+            max_seqlen_k=max_context_len // kernel_stride,
             causal=is_prefilling
         )
         
@@ -454,7 +454,7 @@ def compressed_attention(
             cu_seqlens_k,
             cache_lens,
             max_seqlen_q,
-            max_seqlen_k,
+            # max_seqlen_k,
             max_context_len,
             local_blocks=local_blocks,
             init_blocks=init_blocks,
@@ -495,6 +495,7 @@ def compressed_attention_tilelang(
     local_blocks: int = 2,
     cache_lens=None,
     decode_fused_kernel=None,
+    max_cache_len=-1,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     使用 tilelang online topk kernel 计算 compressed attention topk indices
@@ -507,7 +508,8 @@ def compressed_attention_tilelang(
         is_prefilling = cache_lens is None or max_seqlen_q > 1
         
         # Fixed max_cache_len for CUDA Graph compatibility (avoid .item() calls)
-        max_cache_len = 32768  # 512k
+        # max_cache_len = 525312  # 512k
+        
 
         # Get tensor dimensions
         # q shape: [total_q_len, num_kv_heads, groups, head_dim] or [total_q_len, num_heads, head_dim]
@@ -539,7 +541,7 @@ def compressed_attention_tilelang(
         if is_prefilling:
             # Prefill: use the actual max_seqlen_q
             total_len = max_seqlen_q
-            pooled_k_len = (total_len + block_size - 1) // block_size
+            pooled_k_len = (max_cache_len + block_size - 1) // block_size
         else:
             # Decode: use fixed max_cache_len for CUDA Graph compatibility
             # Kernel uses actual_pooled_k_len internally for dynamic bounds checking
@@ -582,12 +584,21 @@ def compressed_attention_tilelang(
             # =================================================================
             # PREFILL: Use bucketed max_seqlen_q and pooled_k_len
             # Compiles once per unique bucket combination
+            # Supports chunk prefill with cache_lens tensor
             # =================================================================
             bucketed_max_seqlen_q = _bucket_size(max_seqlen_q)
             bucketed_pooled_k_len = _bucket_size(pooled_k_len)
             # Also bucket actual_max_seqlen_q/k to reduce kernel recompilation
             bucketed_actual_max_seqlen_q = _bucket_size(max_seqlen_q)
             bucketed_actual_max_seqlen_k = _bucket_size(max_seqlen_k)
+            
+            # Prepare cache_lens tensor for chunk prefill support
+            # For standard prefill: cache_lens is None -> use zeros
+            # For chunk prefill: cache_lens has values -> use as-is
+            if cache_lens is None:
+                cache_lens_tensor = torch.zeros(batch_size, dtype=torch.int32, device=q.device)
+            else:
+                cache_lens_tensor = cache_lens.to(torch.int32)
             
             kernel = fused_attn_pooling_online_topk_prefill(
                 batch_size=batch_size,
@@ -609,8 +620,8 @@ def compressed_attention_tilelang(
                 dtype_str=dtype_str
             )
             
-            # Run prefill kernel (no cache_lens needed, it's always 0)
-            kernel(q_kernel, k_kernel, cu_seqlens_q, cu_seqlens_k, topk_indices, topk_values)
+            # Run prefill kernel with cache_lens for chunk prefill support
+            kernel(q_kernel, k_kernel, cu_seqlens_q, cu_seqlens_k, cache_lens_tensor, topk_indices, topk_values)
         else:
             # =================================================================
             # DECODE: max_seqlen_q=1 (fixed), cache_lens passed as tensor
@@ -1540,7 +1551,7 @@ class FlashAttentionBackend(AttentionBackend):
                 compressed_cu_seqlens,
                 compressed_cu_seqlens2,
                 max_seqlen_in_batch_q,
-                self.max_context_len // self.kernel_size,
+                # self.max_context_len // self.kernel_size,
                 self.max_context_len,
                 None,
                 init_blocks=self.init_blocks,
@@ -1569,6 +1580,7 @@ class FlashAttentionBackend(AttentionBackend):
                 local_blocks=self.local_blocks,
                 cache_lens=cache_lens,
                 decode_fused_kernel=decode_fused_kernel,
+                max_cache_len=self.max_context_len,
             )
 
         return topk_idx
@@ -1703,7 +1715,7 @@ class FlashAttentionBackend(AttentionBackend):
 
             # assert topk_idx.shape[1] == metadata.seqlen_q_sparse_bs_tensor.sum().item(), "topk_idx[1] {} vs seqlen_q_as_param sum {}".format(
             #     topk_idx.shape[1], metadata.seqlen_q_sparse_bs_tensor.sum().item())
-            sparse_page_table_sparse_bs = sparse_kernel_extension.get_block_table_t_v2(
+            sparse_page_table_sparse_bs = sparse_kernel_extension.get_block_table_v2(
                 topk_idx,
                 page_table,
                 metadata.token_to_bs.to(topk_idx.device),
@@ -2195,7 +2207,7 @@ class FlashAttentionBackend(AttentionBackend):
                                                     forward_batch,
                                                     False)
                 # topk_idx = self.mock_topks[layer.layer_id]
-                sparse_page_table = sparse_kernel_extension.get_block_table_t_v3(
+                sparse_page_table = sparse_kernel_extension.get_block_table_v3(
                             topk_idx,
                             page_table,
                             metadata.token_to_bs,

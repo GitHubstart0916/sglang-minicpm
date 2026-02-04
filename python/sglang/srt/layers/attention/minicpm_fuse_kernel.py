@@ -20,6 +20,7 @@ def _bucket_size(val: int, buckets=(1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024,
 # =============================================================================
 # PREFILL KERNEL - is_causal=True, dynamic UQ/UKV dimensions
 # Aligned with infllmv2_cuda_impl pooling parameters
+# Supports chunk prefill: cache_lens tensor for per-batch cache length
 # =============================================================================
 @tilelang.jit(pass_configs=_pass_configs)
 def fused_attn_pooling_online_topk_prefill(
@@ -52,8 +53,14 @@ def fused_attn_pooling_online_topk_prefill(
     """
     Prefill kernel for Fused Attention + Max Pooling + Online TopK.
     
-    Fixed: is_causal=True, cache_len=0
+    Fixed: is_causal=True
     Static: max_seqlen_q_grid (bucketed for grid), actual_max_seqlen_q/k (exact for causal mask)
+    Runtime: cache_lens tensor for per-batch cache length (supports chunk prefill)
+    
+    Chunk prefill support:
+    - cache_lens: tensor of shape [batch_size], cache length for each batch
+    - When cache_lens[i] = 0, it's standard prefill
+    - When cache_lens[i] > 0, it's chunk prefill (continuing from cached state)
     
     Pooling logic aligned with infllmv2_cuda_impl:
     - For each pool block b, it aggregates k scores in range [b * block_stride - pad_len, b * block_stride - pad_len + num_offs)
@@ -113,6 +120,7 @@ def fused_attn_pooling_online_topk_prefill(
             K_unpad: T.Tensor(kv_shape, dtype),
             cu_seqlens_q: T.Tensor([batch_size + 1], "int32"),
             cu_seqlens_k: T.Tensor([batch_size + 1], "int32"),
+            cache_lens: T.Tensor([batch_size], "int32"),  # Per-batch cache length for chunk prefill
             TopkIndices: T.Tensor(topk_indices_shape, "int32"),
             TopkValues: T.Tensor(topk_values_shape, "float32"),
     ):
@@ -146,8 +154,8 @@ def fused_attn_pooling_online_topk_prefill(
             q_current_seqlen = q_end_idx - q_start_idx
             k_current_seqlen = k_end_idx - k_start_idx
             
-            # Prefill: cache_len = 0
-            cache_len = 0
+            # Chunk prefill: cache_len from tensor (0 for standard prefill, >0 for chunk prefill)
+            cache_len = cache_lens[batch_idx]
             
             T.fill(topk_index_shared, -1)
             T.fill(topk_value_shared, float("-inf"))
