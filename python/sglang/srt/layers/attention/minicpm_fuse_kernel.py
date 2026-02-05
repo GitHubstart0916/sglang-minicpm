@@ -31,8 +31,8 @@ def fused_attn_pooling_online_topk_prefill(
         topk: int,
         max_seqlen_q_grid: int,  # Static param for grid (use bucketing)
         pooled_k_len: int,  # Static param (use bucketing) = ceil(max_seqlen_k / block_size)
-        actual_max_seqlen_q: int,  # Actual for causal mask (NOT bucketed)
-        actual_max_seqlen_k: int,  # Actual for causal mask (NOT bucketed)
+        # actual_max_seqlen_q: int,  # Actual for causal mask (NOT bucketed)
+        # actual_max_seqlen_k: int,  # Actual for causal mask (NOT bucketed)
         m_block_dim: int = 16,
         block_M: int = 16,
         block_N: int = 64,
@@ -156,6 +156,12 @@ def fused_attn_pooling_online_topk_prefill(
             
             # Chunk prefill: cache_len from tensor (0 for standard prefill, >0 for chunk prefill)
             cache_len = cache_lens[batch_idx]
+            # Dynamic pooled length for this batch based on the actual key length.
+            # This matches the effective number of K blocks that contain real tokens.
+            actual_pooled_k_len = (q_current_seqlen + cache_len + block_size - 1) // block_size
+            # Clamp by static pooled_k_len bucket to avoid extra empty pooling blocks
+            # when pooled_k_len is chosen as a large global upper bound.
+            effective_pooled_k_len = T.min(actual_pooled_k_len, pooled_k_len)
             
             T.fill(topk_index_shared, -1)
             T.fill(topk_value_shared, float("-inf"))
@@ -229,7 +235,9 @@ def fused_attn_pooling_online_topk_prefill(
                 for i in T.Parallel(block_M):
                     logsum[i] = logsum[i] * scores_scale[i] + scores_sum[i]
             
-            loop_range_pool = T.ceildiv(pooled_k_len, block_P)
+            # Pooling loop range is now driven by per-batch effective_pooled_k_len,
+            # so large static pooled_k_len buckets will not introduce extra empty work.
+            loop_range_pool = T.ceildiv(effective_pooled_k_len, block_P)
             
             for p_block in T.serial(loop_range_pool):
                 T.fill(pool_max_shared, float("-inf"))
@@ -299,10 +307,10 @@ def fused_attn_pooling_online_topk_prefill(
                             # start_b = ceil((k_idx - num_offs + 1 + pad_len) / block_stride)
                             #         = ceil((k_idx - 5 + 1 + 1) / 4) = ceil((k_idx - 3) / 4)
                             start_pool = T.max(0, (k_idx - num_offs + 1 + pad_len + block_stride - 1) // block_stride)
-                            end_pool = T.min(pooled_k_len - 1, (k_idx + pad_len) // block_stride)
+                            end_pool = T.min(effective_pooled_k_len - 1, (k_idx + pad_len) // block_stride)
                             
                             pool_block_start = p_block * block_P
-                            pool_block_end = T.min((p_block + 1) * block_P, pooled_k_len)
+                            pool_block_end = T.min((p_block + 1) * block_P, effective_pooled_k_len)
                             
                             for p_off in T.serial(num_offs):  # at most num_offs pool blocks per k
                                 p_idx = start_pool + p_off
@@ -313,7 +321,7 @@ def fused_attn_pooling_online_topk_prefill(
                 
                 for p_off in T.Parallel(block_P):
                     p_idx = p_block * block_P + p_off
-                    if p_idx < pooled_k_len and original_q_idx < q_current_seqlen:
+                    if p_idx < effective_pooled_k_len and original_q_idx < q_current_seqlen:
                         off_bq = (original_q_idx + cache_len) // block_size
                         off_bk = p_idx
                         
@@ -472,7 +480,11 @@ def fused_attn_pooling_online_topk_decode(
             k_current_seqlen = k_end_idx - k_start_idx
             
             cache_len = cache_lens[batch_idx]
+            # Dynamic pooled length for this batch (based on current cache_len)
             actual_pooled_k_len = (1 + cache_len + block_size - 1) // block_size
+            # Clamp by static pooled_k_len bucket to avoid extra empty pooling blocks
+            # and to guarantee we never exceed the statically bucketed maximum.
+            effective_pooled_k_len = T.min(actual_pooled_k_len, pooled_k_len)
             
             T.fill(topk_index_shared, -1)
             T.fill(topk_value_shared, float("-inf"))
@@ -526,7 +538,9 @@ def fused_attn_pooling_online_topk_decode(
                 for i in T.Parallel(block_M):
                     logsum[i] = logsum[i] * scores_scale[i] + scores_sum[i]
             
-            loop_range_pool = T.ceildiv(pooled_k_len, block_P)
+            # Pooling loop range is now driven by per-batch effective_pooled_k_len,
+            # so large static pooled_k_len buckets will not introduce extra empty work.
+            loop_range_pool = T.ceildiv(effective_pooled_k_len, block_P)
             
             for p_block in T.serial(loop_range_pool):
                 T.fill(pool_max_shared, float("-inf"))
@@ -568,10 +582,10 @@ def fused_attn_pooling_online_topk_decode(
                         if original_q_idx < q_current_seqlen and k_idx < k_current_seqlen:
                             # Calculate which pool blocks this k_idx contributes to
                             start_pool = T.max(0, (k_idx - num_offs + 1 + pad_len + block_stride - 1) // block_stride)
-                            end_pool = T.min(actual_pooled_k_len - 1, (k_idx + pad_len) // block_stride)
+                            end_pool = T.min(effective_pooled_k_len - 1, (k_idx + pad_len) // block_stride)
                             
                             pool_block_start = p_block * block_P
-                            pool_block_end = T.min((p_block + 1) * block_P, actual_pooled_k_len)
+                            pool_block_end = T.min((p_block + 1) * block_P, effective_pooled_k_len)
                             
                             for p_off in T.serial(num_offs):  # at most num_offs pool blocks per k
                                 p_idx = start_pool + p_off
@@ -582,7 +596,7 @@ def fused_attn_pooling_online_topk_decode(
                 
                 for p_off in T.Parallel(block_P):
                     p_idx = p_block * block_P + p_off
-                    if p_idx < actual_pooled_k_len and original_q_idx < q_current_seqlen:
+                    if p_idx < effective_pooled_k_len and original_q_idx < q_current_seqlen:
                         off_bq = (original_q_idx + cache_len) // block_size
                         off_bk = p_idx
                         

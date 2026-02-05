@@ -186,8 +186,18 @@ class MiniCPMAttention(nn.Module):
             q, k = q.float(), k.float()
             q, k = self.rotary_emb(positions, q, k)
             q, k = q.to(orig_dtype), k.to(orig_dtype)
-    
+
+        if forward_batch.seq_lens_cpu[0] == 8 * 1024 and self.layer_id == 0:
+           torch.cuda.synchronize()
+           torch.cuda.cudart().cudaProfilerStart()
+        # elif self.layer_id == 0:
+        #     print("forward_batch.seq_lens_cpu[0] is {}".format(forward_batch.seq_lens_cpu[0]))
+        
         attn_output = self.attn(q, k, v, forward_batch)
+        
+        if forward_batch.seq_lens_cpu[0] == 8 * 1024 and self.layer_id == 0:
+           torch.cuda.synchronize()
+           torch.cuda.cudart().cudaProfilerStop()
 
         if self.use_output_gate:
             o_gate_output, _ = self.o_gate(hidden_states)

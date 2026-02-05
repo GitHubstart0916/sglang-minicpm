@@ -501,7 +501,7 @@ def compressed_attention_tilelang(
     init_blocks: int = 1,
     local_blocks: int = 2,
     cache_lens=None,
-    decode_fused_kernel=None,
+    fused_kernel=None,
     max_cache_len=-1,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
@@ -553,7 +553,9 @@ def compressed_attention_tilelang(
             # Decode: use fixed max_cache_len for CUDA Graph compatibility
             # Kernel uses actual_pooled_k_len internally for dynamic bounds checking
             pooled_k_len = (max_cache_len + block_size - 1) // block_size
-            assert decode_fused_kernel is not None, "decode_fused_kernel is not initialized"
+            # assert decode_fused_kernel is not None, "decode_fused_kernel is not initialized"
+        
+        assert fused_kernel is not None, "fused_kernel is not initialized"
         
         
         # Pooling parameters - aligned with infllmv2_cuda_impl:
@@ -593,11 +595,11 @@ def compressed_attention_tilelang(
             # Compiles once per unique bucket combination
             # Supports chunk prefill with cache_lens tensor
             # =================================================================
-            bucketed_max_seqlen_q = _bucket_size(max_seqlen_q)
+            # bucketed_max_seqlen_q = _bucket_size(max_seqlen_q)
             bucketed_pooled_k_len = _bucket_size(pooled_k_len)
             # Also bucket actual_max_seqlen_q/k to reduce kernel recompilation
-            bucketed_actual_max_seqlen_q = _bucket_size(max_seqlen_q)
-            bucketed_actual_max_seqlen_k = _bucket_size(max_seqlen_k)
+            # bucketed_actual_max_seqlen_q = _bucket_size(max_seqlen_q)
+            # bucketed_actual_max_seqlen_k = _bucket_size(max_seqlen_k)
             
             # Prepare cache_lens tensor for chunk prefill support
             # For standard prefill: cache_lens is None -> use zeros
@@ -607,28 +609,10 @@ def compressed_attention_tilelang(
             else:
                 cache_lens_tensor = cache_lens.to(torch.int32)
             
-            kernel = fused_attn_pooling_online_topk_prefill(
-                batch_size=batch_size,
-                groups=groups,
-                heads=num_heads,
-                dim=head_dim,
-                topk=kernel_topk,
-                max_seqlen_q_grid=bucketed_max_seqlen_q,  # Bucketed for grid
-                pooled_k_len=bucketed_pooled_k_len,
-                actual_max_seqlen_q=bucketed_actual_max_seqlen_q,  # Bucketed for causal mask
-                actual_max_seqlen_k=bucketed_actual_max_seqlen_k,  # Bucketed for causal mask
-                m_block_dim=16,
-                block_stride=pooling_block_stride,
-                pad_len=pooling_pad_len,
-                num_offs=pooling_num_offs,
-                block_size=block_size,
-                init_blocks=init_blocks,
-                local_blocks=local_blocks,
-                dtype_str=dtype_str
-            )
+            
             
             # Run prefill kernel with cache_lens for chunk prefill support
-            kernel(q_kernel, k_kernel, cu_seqlens_q, cu_seqlens_k, cache_lens_tensor, topk_indices, topk_values)
+            fused_kernel(q_kernel, k_kernel, cu_seqlens_q, cu_seqlens_k, cache_lens_tensor, topk_indices, topk_values)
         else:
             # =================================================================
             # DECODE: max_seqlen_q=1 (fixed), cache_lens passed as tensor
@@ -657,7 +641,7 @@ def compressed_attention_tilelang(
             # )
             
             # Run decode kernel with cache_lens as tensor
-            decode_fused_kernel(q_kernel, k_kernel, cu_seqlens_q, cu_seqlens_k, cache_lens_tensor, topk_indices, topk_values)
+            fused_kernel(q_kernel, k_kernel, cu_seqlens_q, cu_seqlens_k, cache_lens_tensor, topk_indices, topk_values)
         
         # Note: q_idx masking is handled inside the kernel via causal_mask
         # which sets scores to -1e9 for K blocks beyond the causal boundary.
@@ -819,6 +803,7 @@ class FlashAttentionBackend(AttentionBackend):
             # FIXME: Read from model config
             dtype_str = "bfloat16"
             self.decode_fused_kernels = {}
+            self.prefill_fused_kernels = {}
             bucketed_pooled_k_len = _bucket_size(pooled_k_len)
             
             pooling_block_stride = self.block_size // self.kernel_stride  # = 64 // 16 = 4
@@ -827,8 +812,9 @@ class FlashAttentionBackend(AttentionBackend):
 
             if model_runner.server_args.fuse_topk:
                 print("jit start...")
+                
                 for bs in range(1, model_runner.server_args.max_running_requests + 1):
-                    kernel = fused_attn_pooling_online_topk_decode(
+                    decode_kernel = fused_attn_pooling_online_topk_decode(
                         batch_size=bs,
                         groups=self.heads_per_group,
                         heads=model_runner.model_config.num_attention_heads,
@@ -844,7 +830,27 @@ class FlashAttentionBackend(AttentionBackend):
                         local_blocks=self.local_blocks,
                         dtype_str=dtype_str
                     )
-                    self.decode_fused_kernels[bs] = kernel
+                    self.decode_fused_kernels[bs] = decode_kernel
+                    prefill_kernel = fused_attn_pooling_online_topk_prefill(
+                        batch_size=bs,
+                        groups=self.heads_per_group,
+                        heads=model_runner.model_config.num_attention_heads,
+                        dim=self.head_dim,
+                        topk=kernel_topk,
+                        max_seqlen_q_grid=model_runner.server_args.chunked_prefill_size,  # Bucketed for grid
+                        pooled_k_len=bucketed_pooled_k_len,
+                        # actual_max_seqlen_q=bucketed_actual_max_seqlen_q,  # Bucketed for causal mask
+                        # actual_max_seqlen_k=bucketed_actual_max_seqlen_k,  # Bucketed for causal mask
+                        m_block_dim=16,
+                        block_stride=pooling_block_stride,
+                        pad_len=pooling_pad_len,
+                        num_offs=pooling_num_offs,
+                        block_size=self.block_size,
+                        init_blocks=self.init_blocks,
+                        local_blocks=self.local_blocks,
+                        dtype_str=dtype_str
+                    )
+                    self.prefill_fused_kernels[bs] = prefill_kernel
                 print("jit end...")
             # self.block_score_buffer = torch.zeros((self.head_group_num, self.max_context_len, self.max_context_len // self.block_size), dtype=torch.bfloat16, device="cuda")
 
@@ -1447,7 +1453,8 @@ class FlashAttentionBackend(AttentionBackend):
                         max_seqlen_in_batch_k,
                         no_rope_param=no_rope_param,
                         compressed_k=compressed_k, compressed_cu_seqlens=compressed_cu_seqlens,
-                        compressed_k2=compressed_k2, compressed_cu_seqlens2=compressed_cu_seqlens2
+                        compressed_k2=compressed_k2, compressed_cu_seqlens2=compressed_cu_seqlens2,
+                        fused_kernel=self.prefill_fused_kernels[forward_batch.batch_size] if self.fuse_topk else None
                     )
                 return ret
             assert False, "test_prefill must be True for prefill sparse attention"
@@ -1504,7 +1511,7 @@ class FlashAttentionBackend(AttentionBackend):
                             no_rope_param=no_rope_param,
                             compressed_k=self.decode_cuda_graph_metadata["compress_k1"], compressed_cu_seqlens=metadata.cu_seqlens_k1,
                             compressed_k2=self.decode_cuda_graph_metadata["compress_k2"], compressed_cu_seqlens2=metadata.cu_seqlens_k2,
-                            decode_fused_kernel=self.decode_fused_kernels[forward_batch.batch_size] if self.fuse_topk else None
+                            fused_kernel=self.decode_fused_kernels[forward_batch.batch_size] if self.fuse_topk else None
                 )
                 
             else:
@@ -1517,7 +1524,7 @@ class FlashAttentionBackend(AttentionBackend):
                             no_rope_param=no_rope_param,
                             compressed_k=compressed_k, compressed_cu_seqlens=metadata.cu_seqlens_k1,
                             compressed_k2=compressed_k2, compressed_cu_seqlens2=metadata.cu_seqlens_k2,
-                            decode_fused_kernel=self.decode_fused_kernels[forward_batch.batch_size] if self.fuse_topk else None
+                            fused_kernel=self.decode_fused_kernels[forward_batch.batch_size] if self.fuse_topk else None
                 )
 
         return ret
@@ -1532,7 +1539,7 @@ class FlashAttentionBackend(AttentionBackend):
                        no_rope_param=None,
                        compressed_k=None, compressed_cu_seqlens=None,
                        compressed_k2=None, compressed_cu_seqlens2=None,
-                       decode_fused_kernel=None):
+                       fused_kernel=None):
         
         # compressed_seqlens = compressed_cu_seqlens[1:] - compressed_cu_seqlens[:-1]
         cache_lens = None
@@ -1590,7 +1597,7 @@ class FlashAttentionBackend(AttentionBackend):
                 init_blocks=self.init_blocks,
                 local_blocks=self.local_blocks,
                 cache_lens=cache_lens,
-                decode_fused_kernel=decode_fused_kernel,
+                fused_kernel=fused_kernel,
                 max_cache_len=self.max_context_len,
             )
 
