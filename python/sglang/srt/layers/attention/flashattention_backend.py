@@ -905,8 +905,17 @@ class FlashAttentionBackend(AttentionBackend):
         metadata.cu_total_compress_k1_token_nums = F.pad(torch.cumsum(metadata.total_compress_k1_token_nums, dim=0, dtype=torch.int32), (1, 0))
         metadata.cu_total_compress_k2_token_nums = F.pad(torch.cumsum(metadata.total_compress_k2_token_nums, dim=0, dtype=torch.int32), (1, 0))
         
-        metadata.cu_seqlens_q_adjusted = metadata.cu_seqlens_q * self.heads_per_group
-        metadata.max_seqlen_q_adjusted = metadata.max_seq_len_q * self.heads_per_group
+        # FIXME: this is not corrnect when sparse and dense run together
+        seqlens_q_sparse_list = []
+        for i in range(bs):
+            if forward_batch.seq_lens_cpu[i] >= self.dense_len:
+                seqlens_q_sparse_list.append(forward_batch.extend_seq_lens_cpu[i])
+        
+        seqlen_q_sparse_tensor = torch.tensor(seqlens_q_sparse_list, dtype=torch.int32, device=metadata.cu_seqlens_q.device)
+        cu_seqlen_q_sparse_tensor = F.pad(torch.cumsum(seqlen_q_sparse_tensor, dim=0, dtype=torch.int32), (1, 0))
+        # metadata.cu_seqlens_q = torch.cat(cu_seqlens_q_list, dim=0)
+        metadata.cu_seqlens_q_adjusted = cu_seqlen_q_sparse_tensor * self.heads_per_group
+        metadata.max_seqlen_q_adjusted = seqlen_q_sparse_tensor.max().item() * self.heads_per_group
         metadata.cache_seqlens_int32_stage1 = metadata.cache_seqlens_int32 - 1
           
         if forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed():
@@ -1780,8 +1789,8 @@ class FlashAttentionBackend(AttentionBackend):
                 q_reshaped[ps : ps + len_, :, :] = t[0::2, :, :]
                 q_reshaped[ps + len_ : ps + 2 * len_, :, :] = t[1::2, :, :]
 
-                metadata.sparse_page_table[sparse_page_table_idx_start, :] = page_table[dense_bs, : kv_len] * 2
-                metadata.sparse_page_table[sparse_page_table_idx_start + 1, :] = page_table[dense_bs, : kv_len] * 2 + 1
+                metadata.sparse_page_table[sparse_page_table_idx_start, : kv_len] = page_table[dense_bs, : kv_len] * 2
+                metadata.sparse_page_table[sparse_page_table_idx_start + 1, : kv_len] = page_table[dense_bs, : kv_len] * 2 + 1
             # assert not self.enable_cuda_graph or forward_batch.sparse_batch_size == 0, "bs must be all dense or all sparse for cuda graph support"
 
         metadata.sparse_cache_seqlens_int32 = (metadata.sparse_page_table != 0).sum(dim=1).to(dtype=cache_seqlens.dtype, device=cache_seqlens.device)
