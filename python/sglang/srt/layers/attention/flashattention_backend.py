@@ -402,6 +402,7 @@ def compressed_attention(
     total_q: int = -1,
     cu_seqlens_q_adjusted: Optional[torch.Tensor] = None,
     max_seqlen_q_adjusted: Optional[int] = None,
+    split_stage1: bool = False,
     # block_score_buffer: torch.Tensor = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     with torch.no_grad():
@@ -438,19 +439,56 @@ def compressed_attention(
         # Add four buffers k1, k2, cu_seqlens_k1, cu_seqlens_k2 to the decode buffer; 
         # this is reasonable since each attention requires this set of arrays
         # Compute attention scores
-        # 计算attention score
-        score = infllmv2_attn_stage1(
-            q.contiguous(),
-            k.contiguous(),
-            k2.contiguous(),
-            cu_seqlens_q=cu_seqlens_q_adjusted,
-            cu_seqlens_k=cu_seqlens_k,
-            cu_seqlens_v=cu_seqlens_k2,
-            max_seqlen_q=max_seqlen_q_adjusted,
-            max_seqlen_k=max_context_len // kernel_stride,
-            causal=is_prefilling
-        )
-        
+        # split-stage1 -> bmm+softmax+reduce_sum
+        if not is_prefilling and split_stage1:
+            # print("q.shape, k.shape, k2.shape {} {} {}".format(q.shape, k.shape, k2.shape))
+            batch_size = q.shape[0]
+            k1_len = k.shape[0]
+            q_head = q.shape[1]
+            kv_head = k.shape[1]
+            group_size = q_head // kv_head
+            head_dim = k.shape[2]
+            # q_reshape = q.transpose(0, 1)
+            # k_reshape = k.transpose(0, 1).repeat_interleave(16, dim=0)
+            # scale = 1.0 / math.sqrt(128)
+            # score = q_reshape @ k_reshape.transpose(-2, -1) * scale
+            # # attn = q_padded @ k_padded.transpose(-2, -1) * scale
+            # score = F.softmax(score, dim=-1)
+            # score = score.reshape(2, 16, batch_size, k1_len).sum(dim=1)
+            # it seem not correct when bs > 1, but this can lead to a better performance
+            # q_reshape = q.transpose(0, 1).reshape(kv_head, -1, head_dim)
+            # k_reshape = k.transpose(0, 1).transpose(-2, -1)
+            q_reshape = (
+                q.reshape(batch_size, 1, q_head, head_dim)
+                    .transpose(1, 2)
+                    .reshape(batch_size, kv_head, group_size, head_dim)
+                    .transpose(0, 1)
+                    .reshape(-1, group_size, head_dim)
+            )
+            k_reshape = (
+                k.reshape(batch_size, k1_len // batch_size, kv_head, head_dim)
+                .transpose(1, 2)
+                .transpose(-2, -1)
+                .transpose(0, 1)
+                .reshape(-1, head_dim, k1_len // batch_size)
+            )
+    
+            scale = 1.0 / math.sqrt(head_dim)
+            score = torch.bmm(q_reshape, k_reshape) * scale
+            score = F.softmax(score, dim=-1)
+            score = score.reshape(kv_head, batch_size, group_size, k1_len // batch_size).sum(dim=2)
+        else:  
+            score = infllmv2_attn_stage1(
+                q.contiguous(),
+                k.contiguous(),
+                k2.contiguous(),
+                cu_seqlens_q=cu_seqlens_q_adjusted,
+                cu_seqlens_k=cu_seqlens_k,
+                cu_seqlens_v=cu_seqlens_k2,
+                max_seqlen_q=max_seqlen_q_adjusted,
+                max_seqlen_k=max_context_len // kernel_stride,
+                causal=is_prefilling
+            )
         # FIXME: shape is dynamic, not only determined by batch_size, not support cuda graph
         # print("score shape {} {}".format(score.shape, score.dtype))
         # score = score[:, :q_idx.shape[0], :]  # [num_heads, total_q_len, num_blocks]
@@ -786,6 +824,7 @@ class FlashAttentionBackend(AttentionBackend):
             self.k2_kernel_stride = self.kernel_stride * 4
             
             self.fuse_topk = model_runner.server_args.fuse_topk
+            self.split_stage1 = model_runner.server_args.split_stage1
             
             
             max_cache_len = self.max_context_len
@@ -905,20 +944,20 @@ class FlashAttentionBackend(AttentionBackend):
         metadata.cu_total_compress_k1_token_nums = F.pad(torch.cumsum(metadata.total_compress_k1_token_nums, dim=0, dtype=torch.int32), (1, 0))
         metadata.cu_total_compress_k2_token_nums = F.pad(torch.cumsum(metadata.total_compress_k2_token_nums, dim=0, dtype=torch.int32), (1, 0))
         
-        # adjust cu_seqlen_q and max_seqlen_q only consider sparse req
-        seqlens_q_sparse_list = []
-        for i in range(bs):
-            if forward_batch.seq_lens_cpu[i] >= self.dense_len:
-                seqlens_q_sparse_list.append(forward_batch.extend_seq_lens_cpu[i])
-        
-        seqlen_q_sparse_tensor = torch.tensor(seqlens_q_sparse_list, dtype=torch.int32, device=metadata.cu_seqlens_q.device)
-        cu_seqlen_q_sparse_tensor = F.pad(torch.cumsum(seqlen_q_sparse_tensor, dim=0, dtype=torch.int32), (1, 0))
-        # metadata.cu_seqlens_q = torch.cat(cu_seqlens_q_list, dim=0)
-        metadata.cu_seqlens_q_adjusted = cu_seqlen_q_sparse_tensor * self.heads_per_group
-        metadata.max_seqlen_q_adjusted = seqlen_q_sparse_tensor.max().item() * self.heads_per_group
         metadata.cache_seqlens_int32_stage1 = metadata.cache_seqlens_int32 - 1
           
         if forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed():
+            # adjust cu_seqlen_q and max_seqlen_q only consider sparse req
+            seqlens_q_sparse_list = []
+            for i in range(bs):
+                if forward_batch.seq_lens_cpu[i] >= self.dense_len:
+                    seqlens_q_sparse_list.append(forward_batch.extend_seq_lens_cpu[i])
+            
+            seqlen_q_sparse_tensor = torch.tensor(seqlens_q_sparse_list, dtype=torch.int32, device=metadata.cu_seqlens_q.device)
+            cu_seqlen_q_sparse_tensor = F.pad(torch.cumsum(seqlen_q_sparse_tensor, dim=0, dtype=torch.int32), (1, 0))
+            # metadata.cu_seqlens_q = torch.cat(cu_seqlens_q_list, dim=0)
+            metadata.cu_seqlens_q_adjusted = cu_seqlen_q_sparse_tensor * self.heads_per_group
+            metadata.max_seqlen_q_adjusted = seqlen_q_sparse_tensor.max().item() * self.heads_per_group
             bs = forward_batch.batch_size
             cu_seqlens_q = metadata.cu_seqlens_q
             
@@ -991,6 +1030,8 @@ class FlashAttentionBackend(AttentionBackend):
             metadata.token_to_bs = metadata.token_to_bs.to(device=metadata.cu_seqlens_q.device)
             metadata.token_pos_in_bs = metadata.token_pos_in_bs.to(device=metadata.cu_seqlens_q.device)
         else:
+            metadata.cu_seqlens_q_adjusted = metadata.cu_seqlens_q * self.heads_per_group
+            metadata.max_seqlen_q_adjusted = metadata.max_seq_len_q * self.heads_per_group
             cache_seqlens = metadata.cache_seqlens_int32
             page_table = metadata.page_table
             bs = forward_batch.batch_size
@@ -1412,7 +1453,8 @@ class FlashAttentionBackend(AttentionBackend):
                             max_seqlen_in_batch_k,
                             no_rope_param=no_rope_param,
                             compressed_k=compressed_k, compressed_cu_seqlens=metadata.cu_seqlens_k1,
-                            compressed_k2=compressed_k2, compressed_cu_seqlens2=metadata.cu_seqlens_k2
+                            compressed_k2=compressed_k2, compressed_cu_seqlens2=metadata.cu_seqlens_k2,
+                            fused_kernel=self.prefill_fused_kernels[forward_batch.batch_size] if self.fuse_topk else None
                 )
                 
                 return ret
@@ -1631,6 +1673,7 @@ class FlashAttentionBackend(AttentionBackend):
                 cu_seqlens_q_adjusted=self.forward_metadata.cu_seqlens_q_adjusted,
                 max_seqlen_q_adjusted=self.forward_metadata.max_seqlen_q_adjusted,
                 # block_score_buffer=self.forward_metadata.block_score_buffer
+                split_stage1=self.split_stage1,
             )
         else:
             topk_idx = compressed_attention_tilelang(
