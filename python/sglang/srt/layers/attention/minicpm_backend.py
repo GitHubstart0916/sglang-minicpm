@@ -243,6 +243,7 @@ class MiniCPMSparseBackend(AttentionBackend):
         self.k2_kernel_stride = self.kernel_stride * 4
 
         self.fuse_topk = model_runner.server_args.fuse_topk
+        self.split_stage1 = model_runner.server_args.split_stage1
 
 
         max_cache_len = self.max_context_len
@@ -763,6 +764,7 @@ class MiniCPMSparseBackend(AttentionBackend):
                 cache_lens=cache_lens,
                 cu_seqlens_q_adjusted=self.forward_metadata.cu_seqlens_q_adjusted,
                 max_seqlen_q_adjusted=self.forward_metadata.max_seqlen_q_adjusted,
+                split_stage1=self.split_stage1,
                 # block_score_buffer=self.forward_metadata.block_score_buffer
             )
         else:

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
+import math
 from typing import TYPE_CHECKING, Optional
 
 import torch
@@ -267,6 +268,7 @@ def compressed_attention(
     total_q: int = -1,
     cu_seqlens_q_adjusted: Optional[torch.Tensor] = None,
     max_seqlen_q_adjusted: Optional[int] = None,
+    split_stage1: bool = False,
 ) -> torch.Tensor:
     """Compressed attention computation for sparse attention.
 
@@ -327,18 +329,55 @@ def compressed_attention(
         #     )
         # else:
         #     q_idx = cache_lens // block_size
-
-        score = infllmv2_attn_stage1(
-            q.contiguous(),
-            k.contiguous(),
-            k2.contiguous(),
-            cu_seqlens_q=cu_seqlens_q_adjusted,
-            cu_seqlens_k=cu_seqlens_k,
-            cu_seqlens_v=cu_seqlens_k2,
-            max_seqlen_q=max_seqlen_q_adjusted,
-            max_seqlen_k=max_context_len // kernel_stride,
-            causal=is_prefilling,
-        )
+        if not is_prefilling and split_stage1:
+            # print("q.shape, k.shape, k2.shape {} {} {}".format(q.shape, k.shape, k2.shape))
+            batch_size = q.shape[0]
+            k1_len = k.shape[0]
+            q_head = q.shape[1]
+            kv_head = k.shape[1]
+            group_size = q_head // kv_head
+            head_dim = k.shape[2]
+            # q_reshape = q.transpose(0, 1)
+            # k_reshape = k.transpose(0, 1).repeat_interleave(16, dim=0)
+            # scale = 1.0 / math.sqrt(128)
+            # score = q_reshape @ k_reshape.transpose(-2, -1) * scale
+            # # attn = q_padded @ k_padded.transpose(-2, -1) * scale
+            # score = F.softmax(score, dim=-1)
+            # score = score.reshape(2, 16, batch_size, k1_len).sum(dim=1)
+            # it seem not correct when bs > 1, but this can lead to a better performance
+            # q_reshape = q.transpose(0, 1).reshape(kv_head, -1, head_dim)
+            # k_reshape = k.transpose(0, 1).transpose(-2, -1)
+            q_reshape = (
+                q.reshape(batch_size, 1, q_head, head_dim)
+                    .transpose(1, 2)
+                    .reshape(batch_size, kv_head, group_size, head_dim)
+                    .transpose(0, 1)
+                    .reshape(-1, group_size, head_dim)
+            )
+            k_reshape = (
+                k.reshape(batch_size, k1_len // batch_size, kv_head, head_dim)
+                .transpose(1, 2)
+                .transpose(-2, -1)
+                .transpose(0, 1)
+                .reshape(-1, head_dim, k1_len // batch_size)
+            )
+    
+            scale = 1.0 / math.sqrt(head_dim)
+            score = torch.bmm(q_reshape, k_reshape) * scale
+            score = F.softmax(score, dim=-1)
+            score = score.reshape(kv_head, batch_size, group_size, k1_len // batch_size).sum(dim=2)
+        else:
+            score = infllmv2_attn_stage1(
+                q.contiguous(),
+                k.contiguous(),
+                k2.contiguous(),
+                cu_seqlens_q=cu_seqlens_q_adjusted,
+                cu_seqlens_k=cu_seqlens_k,
+                cu_seqlens_v=cu_seqlens_k2,
+                max_seqlen_q=max_seqlen_q_adjusted,
+                max_seqlen_k=max_context_len // kernel_stride,
+                causal=is_prefilling,
+            )
 
         block_score = max_pooling_1d_varlen(
             score.contiguous(),
