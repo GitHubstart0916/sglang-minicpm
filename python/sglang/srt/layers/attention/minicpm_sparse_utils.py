@@ -751,7 +751,7 @@ class SparseBatchAnalyzer:
 
         for i in range(batch_size):
             # Check if sequence length exceeds dense_len threshold
-            if forward_batch.seq_lens_cpu[i] >= self.config.dense_len:
+            if forward_batch.seq_lens_cpu[i] >= 0:
                 sparse_bs_list.append(i)
 
         return sparse_bs_list
@@ -766,7 +766,7 @@ class SparseBatchAnalyzer:
         Returns:
             True if the batch needs sparse attention, False otherwise
         """
-        return bool(forward_batch.seq_lens_cpu[batch_idx] >= self.config.dense_len)
+        return bool(forward_batch.seq_lens_cpu[batch_idx] >= 0)
 
     def get_sparse_batch_count(self, forward_batch: ForwardBatch) -> int:
         """Get the count of sparse batches in the forward batch.

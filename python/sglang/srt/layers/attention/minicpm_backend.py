@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional
 
 import torch
+import torch.nn.functional as F
 
 from sglang.srt.distributed import get_tensor_model_parallel_world_size
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
@@ -407,8 +408,18 @@ class MiniCPMSparseBackend(AttentionBackend):
 
             # Stage1 optimization metadata for prefill mode
             metadata.cache_seqlens_int32_stage1 = metadata.cache_seqlens_int32 - 1
-            metadata.cu_seqlens_q_adjusted = metadata.cu_seqlens_q * self.heads_per_group
-            metadata.max_seqlen_q_adjusted = metadata.max_seq_len_q * self.heads_per_group
+            # metadata.cu_seqlens_q_adjusted = metadata.cu_seqlens_q * self.heads_per_group
+            # metadata.max_seqlen_q_adjusted = metadata.max_seq_len_q * self.heads_per_group
+            seqlens_q_sparse_list = []
+            for i in range(forward_batch.batch_size):
+                if forward_batch.seq_lens_cpu[i] >= self.dense_len:
+                    seqlens_q_sparse_list.append(forward_batch.extend_seq_lens_cpu[i])
+            
+            seqlen_q_sparse_tensor = torch.tensor(seqlens_q_sparse_list, dtype=torch.int32, device=metadata.cu_seqlens_q.device)
+            cu_seqlen_q_sparse_tensor = F.pad(torch.cumsum(seqlen_q_sparse_tensor, dim=0, dtype=torch.int32), (1, 0))
+            # metadata.cu_seqlens_q = torch.cat(cu_seqlens_q_list, dim=0)
+            metadata.cu_seqlens_q_adjusted = cu_seqlen_q_sparse_tensor * self.heads_per_group
+            metadata.max_seqlen_q_adjusted = seqlen_q_sparse_tensor.max().item() * self.heads_per_group
         else:
             decode_metadata = self.sparse_metadata_builder.build_sparse_decode_metadata(
                 forward_batch=forward_batch,
@@ -916,10 +927,10 @@ class MiniCPMSparseBackend(AttentionBackend):
                 q_reshaped[ps : ps + len_, :, :] = t[0::2, :, :]
                 q_reshaped[ps + len_ : ps + 2 * len_, :, :] = t[1::2, :, :]
 
-                metadata.sparse_page_table[sparse_page_table_idx_start, :] = (
+                metadata.sparse_page_table[sparse_page_table_idx_start, :kv_len] = (
                     page_table[dense_bs, :kv_len] * 2
                 )
-                metadata.sparse_page_table[sparse_page_table_idx_start + 1, :] = (
+                metadata.sparse_page_table[sparse_page_table_idx_start + 1, :kv_len] = (
                     page_table[dense_bs, :kv_len] * 2 + 1
                 )
 
