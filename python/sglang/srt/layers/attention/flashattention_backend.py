@@ -802,7 +802,7 @@ class FlashAttentionBackend(AttentionBackend):
             self.init_blocks = minicpm_sparse_config.init_blocks
             self.block_size = minicpm_sparse_config.block_size
             self.window_size = minicpm_sparse_config.window_size
-            self.dense_len = minicpm_sparse_config.dense_len
+            self.dense_len = 0
             topk = minicpm_sparse_config.topk
             self.use_nope = minicpm_sparse_config.use_nope
             self.local_blocks = self.window_size // self.block_size  # local_blocks
@@ -1039,7 +1039,10 @@ class FlashAttentionBackend(AttentionBackend):
             sparse_cache_seqlens_cpu = torch.zeros((bs * self.head_group_num,), dtype=cache_seqlens.dtype, device='cpu')  
             for b in range(bs):
                 if forward_batch.seq_lens_cpu[b] >= self.dense_len:
-                    sparse_cache_len = self.sparse_topk * self.block_size if cache_seqlens[b] % self.block_size == 0 else self.block_size * (self.sparse_topk - 1) + (cache_seqlens[b] % self.block_size)
+                    if forward_batch.seq_lens_cpu[b] <= self.sparse_topk * self.block_size:
+                        sparse_cache_len = forward_batch.seq_lens_cpu[b]
+                    else:
+                        sparse_cache_len = self.sparse_topk * self.block_size if cache_seqlens[b] % self.block_size == 0 else self.block_size * (self.sparse_topk - 1) + (cache_seqlens[b] % self.block_size)
                     if sparse_cache_len > max_sparse_cache_len:
                         max_sparse_cache_len = sparse_cache_len
 
@@ -3095,7 +3098,7 @@ class FlashAttentionBackend(AttentionBackend):
                     # The resulting output shape is [head_num, bs, k1_len], not solely dependent on bs.
                     # Full attention: softmax(Q x K^T/sqrt(d)) x V
                     # Yields shape [bs, hidden_dim], which depends solely on bs
-                    assume_kv_len = self.dense_len
+                    assume_kv_len = 8192
                     assume_k1_len = (assume_kv_len - self.k1_kernel_size) // self.k1_kernel_stride + 1
                     assume_k2_len = (assume_kv_len - self.k2_kernel_size) // self.k2_kernel_stride + 1
                     for i in range(bs):

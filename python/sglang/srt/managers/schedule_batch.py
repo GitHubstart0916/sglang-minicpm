@@ -2050,14 +2050,21 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             k2_kernel_size = k1_kernel_size * 4
             k2_kernel_stride = k1_kernel_stride * 4
             
-            mod_block_size_cpu = self.seq_lens.to(device="cpu") % minicpm_sparse_config.block_size
+            seq_lens_cpu = self.seq_lens.to(device="cpu")
+            mod_block_size_cpu = seq_lens_cpu % minicpm_sparse_config.block_size
+            
             cu_seqlens_k_cpu = F.pad(torch.cumsum(self.seq_lens_cpu, dim=0, dtype=torch.int32), (1, 0))
             cu_seqlens_q_cpu = torch.arange(0, bs + 1, dtype=torch.int32).to(device="cpu")
             
-            sparse_cache_seqlens_cpu = torch.where(
+            sparse_cache_seqlens_cpu_t = torch.where(
                 mod_block_size_cpu == 0,
                 num_sparse_topk_tokens,
                 (sparse_topk - 1) * block_size + mod_block_size_cpu
+            )
+            sparse_cache_seqlens_cpu = torch.where(
+                seq_lens_cpu <= num_sparse_topk_tokens,
+                seq_lens_cpu,
+                sparse_cache_seqlens_cpu_t
             )
             
             self.sparse_cache_seqlens_int32_cpu = torch.repeat_interleave(sparse_cache_seqlens_cpu, 2)
