@@ -269,6 +269,7 @@ def compressed_attention(
     cu_seqlens_q_adjusted: Optional[torch.Tensor] = None,
     max_seqlen_q_adjusted: Optional[int] = None,
     split_stage1: bool = False,
+    layer_id: Optional[int] = -1,
 ) -> torch.Tensor:
     """Compressed attention computation for sparse attention.
 
@@ -301,6 +302,22 @@ def compressed_attention(
     """
     with torch.no_grad():
         batch_size = cu_seqlens_q.shape[0] - 1
+        
+        if layer_id == 0:
+            print("Debug prints for k in compressed_attention(layer 0):")
+            print("q shape {}".format(q.shape))
+            k_print = k.reshape(batch_size, k.shape[0] // batch_size, k.shape[1] * k.shape[2])
+            print("k shape {} k_print shape {}".format(k.shape, k_print.shape))
+            for i in range(batch_size):
+                print("seq_{} k1 shape is {}, value {}".format(i, k_print[i].shape, k_print[i]))
+                
+            k2_print = k2.reshape(batch_size, k2.shape[0] // batch_size, k2.shape[1] * k2.shape[2])
+            print("k2 shape {} k2_print shape {}".format(k2.shape, k2_print.shape))
+            for i in range(batch_size):
+                print("seq_{} k2 shape is {}, value {}".format(i, k2_print[i].shape, k2_print[i]))
+        if max_seqlen_q == 1:
+            assert False, "Debug prints for k and k2"
+            
 
         current_ratio = q.shape[-2] // k.shape[-2]
         required_ratio = 16

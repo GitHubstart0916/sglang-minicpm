@@ -641,7 +641,8 @@ class MiniCPMSparseBackend(AttentionBackend):
                 compressed_cu_seqlens=compressed_cu_seqlens,
                 compressed_k2=compressed_k2,
                 compressed_cu_seqlens2=compressed_cu_seqlens2,
-                decode_fused_kernel=self.decode_fused_kernels[forward_batch.batch_size] if self.fuse_topk else None
+                decode_fused_kernel=self.decode_fused_kernels[forward_batch.batch_size] if self.fuse_topk else None,
+                layer=layer,
             )
             return ret
         else:
@@ -652,8 +653,8 @@ class MiniCPMSparseBackend(AttentionBackend):
                     layer=layer,
                     forward_batch=forward_batch,
                     metadata=metadata,
-                    full_compressed_k1=self.decode_cuda_graph_metadata["compress_k1"],
-                    full_compressed_k2=self.decode_cuda_graph_metadata["compress_k2"],
+                    full_compressed_k1=self.decode_cuda_graph_metadata["compress_k1"][:forward_batch.batch_size * self.max_context_len // self.k1_kernel_stride, :, :],
+                    full_compressed_k2=self.decode_cuda_graph_metadata["compress_k2"][:forward_batch.batch_size * self.max_context_len // self.k2_kernel_stride, :, :],
                     max_context_length=self.max_context_len,
                 )
             else:
@@ -692,11 +693,12 @@ class MiniCPMSparseBackend(AttentionBackend):
                     max_seqlen_in_batch_q,
                     max_seqlen_in_batch_k,
                     no_rope_param=no_rope_param,
-                    compressed_k=self.decode_cuda_graph_metadata["compress_k1"],
+                    compressed_k=self.decode_cuda_graph_metadata["compress_k1"][:forward_batch.batch_size * self.max_context_len // self.k1_kernel_stride, :, :],
                     compressed_cu_seqlens=metadata.k1.cu_seqlens,
-                    compressed_k2=self.decode_cuda_graph_metadata["compress_k2"],
+                    compressed_k2=self.decode_cuda_graph_metadata["compress_k2"][:forward_batch.batch_size * self.max_context_len // self.k2_kernel_stride, :, :],
                     compressed_cu_seqlens2=metadata.k2.cu_seqlens,
-                    decode_fused_kernel=self.decode_fused_kernels[forward_batch.batch_size] if self.fuse_topk else None
+                    decode_fused_kernel=self.decode_fused_kernels[forward_batch.batch_size] if self.fuse_topk else None,
+                    layer=layer,
                 )
 
             else:
@@ -711,7 +713,8 @@ class MiniCPMSparseBackend(AttentionBackend):
                     compressed_cu_seqlens=metadata.k1.cu_seqlens,
                     compressed_k2=compressed_k2,
                     compressed_cu_seqlens2=metadata.k2.cu_seqlens,
-                    decode_fused_kernel=self.decode_fused_kernels[forward_batch.batch_size] if self.fuse_topk else None
+                    decode_fused_kernel=self.decode_fused_kernels[forward_batch.batch_size] if self.fuse_topk else None,
+                    layer=layer,
                 )
 
         return ret
@@ -728,7 +731,8 @@ class MiniCPMSparseBackend(AttentionBackend):
         compressed_cu_seqlens=None,
         compressed_k2=None,
         compressed_cu_seqlens2=None,
-        decode_fused_kernel=None
+        decode_fused_kernel=None,
+        layer=None,
     ):
         cache_lens = None
         if max_seqlen_in_batch_k > max_seqlen_in_batch_q:
@@ -765,6 +769,7 @@ class MiniCPMSparseBackend(AttentionBackend):
                 cu_seqlens_q_adjusted=self.forward_metadata.cu_seqlens_q_adjusted,
                 max_seqlen_q_adjusted=self.forward_metadata.max_seqlen_q_adjusted,
                 split_stage1=self.split_stage1,
+                layer_id=layer.layer_id,
                 # block_score_buffer=self.forward_metadata.block_score_buffer
             )
         else:
