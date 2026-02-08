@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
+import math
 from typing import TYPE_CHECKING, Optional
 
 import torch

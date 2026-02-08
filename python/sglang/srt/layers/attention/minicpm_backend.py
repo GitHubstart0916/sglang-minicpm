@@ -1820,6 +1820,31 @@ class MiniCPMSparseBackend(AttentionBackend):
             metadata.k2.cu_total_compress_token_nums[: real_bs + 1].copy_(
                 forward_batch.cu_total_compress_k2_token_nums_cpu
             )
+            
+            if real_bs < bs:
+                metadata.sparse_cache_seqlens_int32[2 * real_bs : ].fill_(0)
+                metadata.sparse_cu_seqlens_k[2 * real_bs + 1 : ].fill_(forward_batch.sparse_cu_seqlens_k_cpu[-1])
+                metadata.cache_seqlens_int32_stage1[real_bs:].fill_(0)
+                metadata.k1.cu_seqlens[real_bs + 1 :].fill_(forward_batch.cu_seqlens_k1_cpu[-1])
+                metadata.k2.cu_seqlens[real_bs + 1 :].fill_(forward_batch.cu_seqlens_k2_cpu[-1])
+                metadata.k1.history_compress_token_nums[real_bs:].fill_(0)
+                metadata.k2.history_compress_token_nums[real_bs:].fill_(0)
+                metadata.k1.new_token_nums[real_bs:].fill_(0)
+                metadata.k2.new_token_nums[real_bs:].fill_(0)
+                metadata.k1.cu_new_token_nums[real_bs + 1 :].fill_(forward_batch.cu_new_k1_token_nums_cpu[-1])
+                metadata.k2.cu_new_token_nums[real_bs + 1 :].fill_(forward_batch.cu_new_k2_token_nums_cpu[-1])
+                metadata.k1.new_compress_token_nums[real_bs:].fill_(0)
+                metadata.k2.new_compress_token_nums[real_bs:].fill_(0)
+
+                metadata.k1.cu_new_compress_token_nums[real_bs + 1 :].fill_(forward_batch.cu_new_compress_k1_token_nums_cpu[-1])
+                metadata.k2.cu_new_compress_token_nums[real_bs + 1 :].fill_(forward_batch.cu_new_compress_k2_token_nums_cpu[-1])
+                metadata.k1.total_compress_token_nums[real_bs:].fill_(0)
+                metadata.k2.total_compress_token_nums[real_bs:].fill_(0)
+
+                metadata.k1.cu_total_compress_token_nums[real_bs + 1 :].fill_(forward_batch.cu_total_compress_k1_token_nums_cpu[-1])
+
+                metadata.k2.cu_total_compress_token_nums[real_bs + 1 :].fill_(forward_batch.cu_total_compress_k2_token_nums_cpu[-1])
+                
 
             metadata.k1.table.copy_(self.req_to_sparse_k1_token[req_pool_indices])
             metadata.k2.table.copy_(self.req_to_sparse_k2_token[req_pool_indices])
