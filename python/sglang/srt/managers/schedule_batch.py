@@ -2073,7 +2073,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             self.cache_seqlens_int32_stage1_cpu = self.seq_lens_cpu - 1
             
             self.seqlens_k1_cpu = (self.cache_seqlens_int32_cpu - k1_kernel_size) // k1_kernel_stride + 1
+            self.seqlens_k1_cpu.clamp_(min=0)
             self.seqlens_k2_cpu = (self.cache_seqlens_int32_cpu - k2_kernel_size) // k2_kernel_stride + 1
+            self.seqlens_k2_cpu.clamp_(min=0)
             self.cu_seqlens_k1_cpu = F.pad(torch.cumsum(self.seqlens_k1_cpu, dim=0, dtype=torch.int32), (1, 0))
             self.cu_seqlens_k2_cpu = F.pad(torch.cumsum(self.seqlens_k2_cpu, dim=0, dtype=torch.int32), (1, 0))
             
