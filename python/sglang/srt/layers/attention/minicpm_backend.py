@@ -579,15 +579,17 @@ class MiniCPMSparseBackend(AttentionBackend):
             if all_sparse:
                 # all batch is sparse
                 metadata = self.forward_metadata
-                compressed_k = torch.zeros(
+                compressed_k = torch.full(
                     (forward_batch.batch_size * self.max_context_len // self.k1_kernel_stride, self.head_group_num, self.head_dim),
                     dtype=torch.bfloat16,
-                    device=self.device
-                        )
-                compressed_k2 = torch.zeros(
+                    device=self.device,
+                    fill_value=float('-inf')
+                )
+                compressed_k2 = torch.full(
                     (forward_batch.batch_size * self.max_context_len // self.k2_kernel_stride, self.head_group_num, self.head_dim), 
                     dtype=torch.bfloat16, 
-                    device=self.device
+                    device=self.device,
+                    fill_value=float('-inf')
                 )
 
                 get_compress_k_v2(

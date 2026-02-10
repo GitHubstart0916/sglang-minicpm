@@ -503,8 +503,9 @@ def compressed_attention(
             )
     
             scale = 1.0 / math.sqrt(head_dim)
-            score = torch.bmm(q_reshape, k_reshape) * scale
-            score = F.softmax(score, dim=-1)
+            score = torch.bmm(q_reshape, k_reshape).mul_(scale)
+            torch.nan_to_num(score, nan=float("-inf"), posinf=float("-inf"), out=score)
+            torch.softmax(score, dim=-1, out=score)
             score = score.reshape(kv_head, batch_size, group_size, k1_len // batch_size).sum(dim=2)
         else:  
             score = infllmv2_attn_stage1(
