@@ -1745,7 +1745,8 @@ class MiniCPMSparseBackend(AttentionBackend):
             # Update flashinfer metadata for CUDA graph replay
             # For sparse mode, use the wrapper-based pattern that preserves sparse_page_table
             if self.attention_kernel_type == "flashinfer":
-                sparse_bs = real_bs * 2
+                sparse_bs = bs * 2
+                sparse_real_bs = real_bs * 2
 
                 # Get views of pre-allocated buffers
                 # kv_indptr is precomputed and static: [0, 1*K, 2*K, ..., sparse_bs*K]
@@ -1759,6 +1760,7 @@ class MiniCPMSparseBackend(AttentionBackend):
                 kv_last_page_len_view = self.decode_cuda_graph_metadata[
                     "flashinfer_kv_last_page_len"
                 ][:sparse_bs]
+                kv_last_page_len_view[sparse_real_bs:].fill_(0)
 
                 # Retrieve the wrapper stored during capture
                 wrapper = metadata.decode_wrapper
