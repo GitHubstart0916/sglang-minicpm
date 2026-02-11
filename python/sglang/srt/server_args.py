@@ -1516,7 +1516,7 @@ class ServerArgs:
                         )
                         self.disable_radix_cache = True
                         self.disable_overlap_schedule = False
-        elif model_arch in ["MiniCPMForCausalLM"]:
+        elif model_arch in ["MiniCPMForCausalLM", "MiniCPMSALAForCausalLM"]:
             if self.force_dense_minicpm:
                 if self.attention_backend == "minicpm_flashattn":
                     self.attention_backend = "fa3"
