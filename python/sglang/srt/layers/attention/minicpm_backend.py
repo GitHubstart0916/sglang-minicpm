@@ -1763,6 +1763,7 @@ class MiniCPMSparseBackend(AttentionBackend):
                 kv_last_page_len_view = self.decode_cuda_graph_metadata[
                     "flashinfer_kv_last_page_len"
                 ][:sparse_bs]
+                kv_indptr_view[sparse_real_bs:].fill_(kv_indptr_view[-1])
                 kv_last_page_len_view[sparse_real_bs:].fill_(0)
 
                 # Retrieve the wrapper stored during capture
