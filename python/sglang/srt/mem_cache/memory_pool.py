@@ -1031,7 +1031,7 @@ class MHATokenToKVPool(KVCache):
         else:
             self.k_buffer[layer_id - self.start_layer][loc] = cache_k
             self.v_buffer[layer_id - self.start_layer][loc] = cache_v
-
+        
     def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
         if envs.SGLANG_NATIVE_MOVE_KV_CACHE.get():
             move_kv_cache_native(self.k_buffer, self.v_buffer, tgt_loc, src_loc)
@@ -1081,6 +1081,71 @@ class MHATokenToKVPool(KVCache):
                 num_stages=2,
             )
 
+class MHATransposedTokenToKVPool(MHATokenToKVPool):
+    # kv cache layout: [num_pages, num_heads, page_size, head_dim]
+    def set_kv_buffer(
+        self,
+        layer: RadixAttention,
+        loc: torch.Tensor,
+        cache_k: torch.Tensor,
+        cache_v: torch.Tensor,
+        k_scale: Optional[float] = None,
+        v_scale: Optional[float] = None,
+        layer_id_override: Optional[int] = None,
+    ):
+        from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
+
+        if layer_id_override is not None:
+            layer_id = layer_id_override
+        else:
+            layer_id = layer.layer_id
+        if cache_k.dtype != self.dtype:
+            if k_scale is not None:
+                cache_k.div_(k_scale)
+            if v_scale is not None:
+                cache_v.div_(v_scale)
+            cache_k = cache_k.to(self.dtype)
+            cache_v = cache_v.to(self.dtype)
+
+        if self.store_dtype != self.dtype:
+            cache_k = cache_k.view(self.store_dtype)
+            cache_v = cache_v.view(self.store_dtype)
+
+        if self.page_size == 1:
+            if get_is_capture_mode() and self.alt_stream is not None:
+                # Overlap the copy of K and V cache for small batch size
+                current_stream = self.device_module.current_stream()
+                self.alt_stream.wait_stream(current_stream)
+                self.k_buffer[layer_id - self.start_layer][loc] = cache_k
+                with self.device_module.stream(self.alt_stream):
+                    self.v_buffer[layer_id - self.start_layer][loc] = cache_v
+                current_stream.wait_stream(self.alt_stream)
+            else:
+                self.k_buffer[layer_id - self.start_layer][loc] = cache_k
+                self.v_buffer[layer_id - self.start_layer][loc] = cache_v
+        else:
+            tokens, nhead, head_size = cache_k.shape
+            BLOCK_D = triton.next_power_of_2(head_size)
+            grid = (tokens, nhead)
+            reshape_and_cache_kernel[grid](
+                cache_k,
+                cache_v,
+                self.k_buffer[layer_id - self.start_layer],
+                self.v_buffer[layer_id - self.start_layer],
+                loc,
+                tokens, 
+                nhead, 
+                head_size,
+                self.page_size,
+                cache_k.stride(0), 
+                cache_k.stride(1), 
+                cache_k.stride(2),
+                nhead * self.page_size * head_size,
+                self.page_size * head_size,
+                head_size,
+                1,
+                BLOCK_D=BLOCK_D,
+            )
 
 class MHATokenToKVPoolFP4(MHATokenToKVPool):
 
@@ -1256,11 +1321,13 @@ class HybridLinearKVPool(KVCache):
         self.head_dim = head_dim
         self.mamba_pool = mamba_pool
         # TODO MHATransposedTokenToKVPool if enable_kvcache_transpose is True
-        assert not enable_kvcache_transpose
+        # assert not enable_kvcache_transpose
         self.use_mla = use_mla
         if not use_mla:
-
-            TokenToKVPoolClass = MHATokenToKVPool
+            if enable_kvcache_transpose:
+                TokenToKVPoolClass = MHATransposedTokenToKVPool
+            else:
+                TokenToKVPoolClass = MHATokenToKVPool
 
             if _is_npu:
                 from sglang.srt.hardware_backend.npu.memory_pool_npu import (
@@ -2065,3 +2132,60 @@ def copy_all_layer_kv_cache_tiled(
     mask = mask_loc[:, None] & mask_byte[None, :]
     vals = tl.load(src_ptr, mask=mask)
     tl.store(tgt_ptr, vals, mask=mask)
+
+@triton.jit
+def reshape_and_cache_kernel(
+    k_ptr, v_ptr,
+    k_cache_ptr, v_cache_ptr,
+    loc_ptr,
+    tokens, nhead, headsize,
+    pagesize,
+    stride_k_token, stride_k_head, stride_k_dim,
+    stride_cache_page, stride_cache_head, stride_cache_in_page, stride_cache_dim,
+    BLOCK_D: tl.constexpr,
+):
+    token_id = tl.program_id(0)
+    head_id  = tl.program_id(1)
+
+    if token_id >= tokens or head_id >= nhead:
+        return
+
+    flat_index = tl.load(loc_ptr + token_id)
+
+    page_id = flat_index // pagesize
+    token_id_in_page  = flat_index % pagesize
+
+    k_src = (
+        k_ptr
+        + token_id * stride_k_token
+        + head_id  * stride_k_head
+    )
+
+    v_src = (
+        v_ptr
+        + token_id * stride_k_token
+        + head_id  * stride_k_head
+    )
+
+    k_dst = (
+        k_cache_ptr
+        + page_id * stride_cache_page
+        + head_id * stride_cache_head
+        + token_id_in_page * stride_cache_in_page
+    )
+
+    v_dst = (
+        v_cache_ptr
+        + page_id * stride_cache_page
+        + head_id * stride_cache_head
+        + token_id_in_page * stride_cache_in_page
+    )
+
+    offsets = tl.arange(0, BLOCK_D)
+    mask = offsets < headsize
+
+    k_val = tl.load(k_src + offsets * stride_k_dim, mask=mask)
+    v_val = tl.load(v_src + offsets * stride_k_dim, mask=mask)
+
+    tl.store(k_dst + offsets * stride_cache_dim, k_val, mask=mask)
+    tl.store(v_dst + offsets * stride_cache_dim, v_val, mask=mask)

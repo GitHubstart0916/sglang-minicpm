@@ -234,6 +234,7 @@ class MiniCPMSparseBackend(AttentionBackend):
         self.local_blocks = self.window_size // self.block_size  # local_blocks
         self.sparse_topk = topk + (self.window_size // self.block_size)
         self.num_sparse_topk_tokens = self.block_size * self.sparse_topk
+        self.num_sparse_topk_blocks = self.num_sparse_topk_tokens // self.page_size
 
         # Head group number derived from model configuration
         self.head_dim = model_runner.model_config.head_dim
@@ -416,7 +417,8 @@ class MiniCPMSparseBackend(AttentionBackend):
                     head_group_num=self.head_group_num,
                     dense_len=self.dense_len,
                     sparse_topk=self.sparse_topk,
-                    block_size=self.block_size,
+                    sparse_block_size=self.block_size,
+                    page_size=self.page_size,
                     cu_seqlens_q=cu_seqlens_q,
                     sparse_page_table_dtype=metadata.page_table.dtype,
                     sparse_page_table_device=metadata.page_table.device,
@@ -453,7 +455,8 @@ class MiniCPMSparseBackend(AttentionBackend):
                 head_group_num=self.head_group_num,
                 dense_len=self.dense_len,
                 sparse_topk=self.sparse_topk,
-                block_size=self.block_size,
+                sparse_block_size=self.block_size,
+                page_size=self.page_size,
             )
 
             metadata.sparse_cache_seqlens_int32 = decode_metadata[
@@ -519,6 +522,9 @@ class MiniCPMSparseBackend(AttentionBackend):
             else:
                 metadata.max_seq_len_q = metadata.max_seq_len_k
                 metadata.cu_seqlens_q = metadata.cu_seqlens_k
+
+            metadata.sparse_cache_seqlens_int32 = forward_batch.sparse_cache_seqlens_int32_cpu.to(device=device)
+            metadata.sparse_cu_seqlens_k = forward_batch.sparse_cu_seqlens_k_cpu.to(device=device)
 
         # Encoder metadata for cross attention
         if forward_batch.encoder_lens is not None:
@@ -599,6 +605,7 @@ class MiniCPMSparseBackend(AttentionBackend):
                     full_compressed_k1=compressed_k, # output
                     full_compressed_k2=compressed_k2, # output
                     max_context_length=self.max_context_len,
+                    page_size=self.page_size,
                 )
                 
                 cu_seqlens_k = metadata.cu_seqlens_k
@@ -649,6 +656,7 @@ class MiniCPMSparseBackend(AttentionBackend):
                 device=key_states.device,
                 max_context_length=self.max_context_len,
                 split_stage1=self.split_stage1,
+                page_size=self.page_size,
             )
 
             pt_k1, pt_k2 = 0, 0
@@ -726,6 +734,7 @@ class MiniCPMSparseBackend(AttentionBackend):
                         full_compressed_k1=self.decode_cuda_graph_metadata["compress_k1"][:forward_batch.batch_size * self.max_context_len // self.k1_kernel_stride, :, :],
                         full_compressed_k2=self.decode_cuda_graph_metadata["compress_k2"][:forward_batch.batch_size * self.max_context_len // self.k2_kernel_stride, :, :],
                         max_context_length=self.max_context_len,
+                        page_size=self.page_size,
                     )
                 else:
                     get_compress_k_v2(
@@ -735,6 +744,7 @@ class MiniCPMSparseBackend(AttentionBackend):
                         full_compressed_k1=self.decode_cuda_graph_metadata["compress_k1"][:forward_batch.batch_size * self.max_context_len // self.k1_kernel_stride, :, :],
                         full_compressed_k2=self.decode_cuda_graph_metadata["compress_k2"][:forward_batch.batch_size * self.max_context_len // self.k2_kernel_stride, :, :],
                         max_context_length=self.max_context_len,
+                        page_size=self.page_size,
                     )
             else:
                 compressed_k, compressed_k2 = allocate_and_compress_keys(
@@ -751,6 +761,7 @@ class MiniCPMSparseBackend(AttentionBackend):
                     device=self.device,
                     max_context_length=self.max_context_len,
                     split_stage1=self.split_stage1,
+                    page_size=self.page_size,
                 )
 
             topk_metadata = self.sparse_metadata_builder.build_decode_topk_metadata(
@@ -962,11 +973,12 @@ class MiniCPMSparseBackend(AttentionBackend):
                 metadata.token_to_bs,
                 metadata.token_pos_in_bs,
                 metadata.seqlen_k_sparse_bs_tensor,
-                self.sparse_topk
-            ).reshape(-1, self.num_sparse_topk_tokens)
+                self.sparse_topk,
+                self.page_size,
+            ).reshape(-1, self.num_sparse_topk_blocks)
 
             # copy page table for sparse bs
-            metadata.sparse_page_table[forward_batch.sparse_idx, :self.num_sparse_topk_tokens] = sparse_page_table_sparse_bs
+            metadata.sparse_page_table[forward_batch.sparse_idx, :self.num_sparse_topk_blocks] = sparse_page_table_sparse_bs
         else:
             total_k1 = self.forward_metadata.k1.cu_total_compress_token_nums[-1].item()
             total_k2 = self.forward_metadata.k2.cu_total_compress_token_nums[-1].item()
@@ -981,6 +993,7 @@ class MiniCPMSparseBackend(AttentionBackend):
                 device=k.device,
                 max_context_length=self.max_context_len,
                 split_stage1=self.split_stage1,
+                page_size=self.page_size,
             )
 
         q_reshaped = q.contiguous().view(-1, layer.tp_q_head_num // 2, layer.head_dim)
@@ -1016,15 +1029,6 @@ class MiniCPMSparseBackend(AttentionBackend):
 
                 metadata.sparse_page_table[sparse_page_table_idx_start, : kv_len] = page_table[dense_bs, : kv_len] * 2
                 metadata.sparse_page_table[sparse_page_table_idx_start + 1, : kv_len] = page_table[dense_bs, : kv_len] * 2 + 1
-
-        metadata.sparse_cache_seqlens_int32 = (
-            (metadata.sparse_page_table != 0)
-            .sum(dim=1)
-            .to(dtype=cache_seqlens.dtype, device=cache_seqlens.device)
-        )
-
-        # this seem not necessary to update perlayer
-        metadata.sparse_cu_seqlens_k = F.pad(torch.cumsum(metadata.sparse_cache_seqlens_int32, dim=0, dtype=cu_seqlens_k.dtype), (1, 0))
 
         key_cache, value_cache = forward_batch.token_to_kv_pool.get_kv_buffer(
             layer.layer_id
@@ -1178,23 +1182,33 @@ class MiniCPMSparseBackend(AttentionBackend):
             forward_batch,
             False,
         )
-        sparse_page_table = sparse_kernel_extension.get_block_table_v3(
-            topk_idx,
-            page_table,
-            metadata.token_to_bs,
-            cache_seqlens,
-            cache_seqlens,
-            self.sparse_topk
-        ).reshape(-1, self.num_sparse_topk_tokens)
+        if self.page_size > 1:
+            sparse_page_table = sparse_kernel_extension.get_block_table_v2(
+                topk_idx,
+                page_table,
+                metadata.token_to_bs,
+                cache_seqlens,
+                cache_seqlens,
+                self.sparse_topk,
+                self.page_size,
+            ).reshape(-1, self.num_sparse_topk_blocks)
+        else:
+            sparse_page_table = sparse_kernel_extension.get_block_table_v3(
+                topk_idx,
+                page_table,
+                metadata.token_to_bs,
+                cache_seqlens,
+                cache_seqlens,
+                self.sparse_topk
+            ).reshape(-1, self.num_sparse_topk_blocks)
 
-        metadata.sparse_page_table[: 2 * bs, : self.num_sparse_topk_tokens] = (
-            sparse_page_table[:, : self.num_sparse_topk_tokens]
+        metadata.sparse_page_table[: 2 * bs, : self.num_sparse_topk_blocks] = (
+            sparse_page_table[:, : self.num_sparse_topk_blocks]
         )
 
         q_reshaped_by_head_group = q_reshaped.reshape(
             -1, layer.tp_q_head_num // 2, layer.head_dim
         )
-        assert self.page_size == 1
         key_cache_by_head_group = key_cache.reshape(
             -1, self.page_size, layer.tp_k_head_num // 2, layer.head_dim
         )
@@ -1245,7 +1259,7 @@ class MiniCPMSparseBackend(AttentionBackend):
 
         # Use the attention kernel abstraction
         result = self.attention_kernel.forward(attn_params, layer)
-
+        
         o = result
 
         return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
@@ -1260,18 +1274,16 @@ class MiniCPMSparseBackend(AttentionBackend):
         to avoid memory allocations.
         """
         max_num_pages = (self.max_context_len + self.page_size - 1) // self.page_size
+        # k1/k2 cache layout: [num_pages, page_size, num_kv_heads, head_size] -> 
+        # [tokens, num_kv_heads, head_size] -> can be treated as non-paged
         max_k1_num_pages = (
             (self.max_context_len - self.k1_kernel_size) // self.k1_kernel_stride
             + 1
-            + self.page_size
-            - 1
-        ) // self.page_size
+        )
         max_k2_num_pages = (
             (self.max_context_len - self.k2_kernel_size) // self.k2_kernel_stride
             + 1
-            + self.page_size
-            - 1
-        ) // self.page_size
+        )
         sparse_max_num_pages = (
             self.num_sparse_topk_tokens + self.page_size - 1
         ) // self.page_size
@@ -1868,7 +1880,6 @@ class MiniCPMSparseBackend(AttentionBackend):
 
                 metadata.k2.cu_total_compress_token_nums[real_bs + 1 :].fill_(forward_batch.cu_total_compress_k2_token_nums_cpu[-1])
                 
-
             metadata.k1.table.copy_(self.req_to_sparse_k1_token[req_pool_indices])
             metadata.k2.table.copy_(self.req_to_sparse_k2_token[req_pool_indices])
         else:

@@ -73,6 +73,7 @@ def compress_k_core_new(
     kernel_size,
     kernel_stride,
     max_context_length,
+    page_size,
 ):
 
     head_num_k = key_cache.shape[1]
@@ -129,6 +130,7 @@ def compress_k_core_new(
         kernel_stride,
         BLOCK_SIZE,
         max_grid_chunks,  # Pass the limit to kernel for loop control
+        page_size,
     )
 
     return
@@ -141,6 +143,7 @@ def get_compress_k_v2(
     full_compressed_k1,
     full_compressed_k2,
     max_context_length,
+    page_size,
 ):
     batch = len(forward_batch.req_pool_indices)
 
@@ -186,6 +189,7 @@ def get_compress_k_v2(
         k1_l,
         k1_stride,
         max_context_length,
+        page_size,
     )
 
     # deal with k2
@@ -207,6 +211,7 @@ def get_compress_k_v2(
         k2_l,
         k2_stride,
         max_context_length,
+        page_size,
     )
 
     return
@@ -230,6 +235,7 @@ def compress_k_core_new_padded(
     kernel_size,
     kernel_stride,
     max_context_length,
+    page_size,
 ):
     """Padded layout version: stores data in batch-major order for reshape compatibility."""
     head_num_k = key_cache.shape[1]
@@ -266,6 +272,7 @@ def compress_k_core_new_padded(
         kernel_stride,
         BLOCK_SIZE,
         max_grid_chunks,
+        page_size,
     )
     return
 
@@ -277,6 +284,7 @@ def get_compress_k_v2_padded(
     full_compressed_k1,
     full_compressed_k2,
     max_context_length,
+    page_size,
 ):
     """Padded layout version for debugging with reshape()."""
     batch = len(forward_batch.req_pool_indices)
@@ -308,6 +316,7 @@ def get_compress_k_v2_padded(
         k1_l,
         k1_stride,
         max_context_length,
+        page_size,
     )
 
     # deal with k2
@@ -329,6 +338,7 @@ def get_compress_k_v2_padded(
         k2_l,
         k2_stride,
         max_context_length,
+        page_size,
     )
 
     return
@@ -344,6 +354,7 @@ def allocate_and_compress_keys(
     device: torch.device = None,
     max_context_length: int = 32768,
     split_stage1: bool = False,
+    page_size: int = 64,
 ):
     """Allocate compressed key tensors and run compression.
 
@@ -381,6 +392,7 @@ def allocate_and_compress_keys(
             full_compressed_k1,
             full_compressed_k2,
             max_context_length=max_context_length,
+            page_size=page_size,
         )
     else:
         get_compress_k_v2(
@@ -390,6 +402,7 @@ def allocate_and_compress_keys(
             full_compressed_k1,
             full_compressed_k2,
             max_context_length=max_context_length,
+            page_size=page_size,
         )
 
     return full_compressed_k1, full_compressed_k2
@@ -1254,7 +1267,8 @@ class SparseMetadataBuilder:
         head_group_num: int,
         dense_len: int,
         sparse_topk: int,
-        block_size: int,
+        sparse_block_size: int,
+        page_size: int,
         cu_seqlens_q: torch.Tensor,
         sparse_page_table_dtype: torch.dtype,
         sparse_page_table_device: torch.device,
@@ -1271,7 +1285,7 @@ class SparseMetadataBuilder:
             head_group_num: Number of head groups
             dense_len: Dense length threshold for sparse activation
             sparse_topk: Top-K value for sparse attention
-            block_size: Block size for sparse attention
+            sparse_block_size: Block size for sparse attention
             cu_seqlens_q: Cumulative query sequence lengths
             sparse_page_table_dtype: Data type for sparse page table
             sparse_page_table_device: Device for sparse page table
@@ -1289,7 +1303,7 @@ class SparseMetadataBuilder:
         for i in range(bs):
             if forward_batch.seq_lens_cpu[i] >= dense_len:
                 max_sparse_cache_len = max(
-                    max_sparse_cache_len, sparse_topk * block_size
+                    max_sparse_cache_len, sparse_topk * sparse_block_size
                 )
                 sparse_page_table_bs += (
                     forward_batch.extend_seq_lens_cpu[i] * head_group_num
@@ -1311,7 +1325,7 @@ class SparseMetadataBuilder:
                 )
 
         sparse_page_table = torch.zeros(
-            (sparse_page_table_bs, max_sparse_cache_len),
+            (sparse_page_table_bs, (max_sparse_cache_len + page_size - 1) // page_size),
             dtype=sparse_page_table_dtype,
             device=sparse_page_table_device,
         )
@@ -1364,7 +1378,8 @@ class SparseMetadataBuilder:
         head_group_num: int,
         dense_len: int,
         sparse_topk: int,
-        block_size: int,
+        sparse_block_size: int,
+        page_size: int,
     ) -> dict:
         """Build sparse decode metadata.
 
@@ -1376,7 +1391,7 @@ class SparseMetadataBuilder:
             head_group_num: Number of head groups
             dense_len: Dense length threshold
             sparse_topk: Top-K value for sparse attention
-            block_size: Block size
+            sparse_block_size: Block size
 
         Returns:
             Dictionary with decode metadata
@@ -1392,13 +1407,13 @@ class SparseMetadataBuilder:
 
         for b in range(bs):
             if forward_batch.seq_lens_cpu[b] >= dense_len:
-                if forward_batch.seq_lens_cpu[b] <= sparse_topk * block_size:
+                if forward_batch.seq_lens_cpu[b] <= sparse_topk * sparse_block_size:
                     sparse_cache_len = forward_batch.seq_lens_cpu[b]
-                elif cache_seqlens[b] % block_size == 0:
-                    sparse_cache_len = sparse_topk * block_size
+                elif cache_seqlens[b] % sparse_block_size == 0:
+                    sparse_cache_len = sparse_topk * sparse_block_size
                 else:
-                    sparse_cache_len = block_size * (sparse_topk - 1) + (
-                        cache_seqlens[b] % block_size
+                    sparse_cache_len = sparse_block_size * (sparse_topk - 1) + (
+                        cache_seqlens[b] % sparse_block_size
                     )
 
                 if sparse_cache_len > max_sparse_cache_len:
@@ -1427,7 +1442,7 @@ class SparseMetadataBuilder:
         )
         token_to_bs = torch.arange(0, bs, dtype=torch.int32, device="cuda")
         sparse_page_table = torch.zeros(
-            (2 * bs, sparse_topk * block_size),
+            (2 * bs, (sparse_topk * sparse_block_size + page_size - 1) // page_size),
             dtype=page_table.dtype,
             device=page_table.device,
         )

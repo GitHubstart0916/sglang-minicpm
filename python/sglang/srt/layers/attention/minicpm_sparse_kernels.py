@@ -27,6 +27,7 @@ def compress_k_complete_kernel_new(
     kernel_stride: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
     max_grid_chunks: tl.constexpr,
+    page_size: tl.constexpr,
  ):
     """
     Single-kernel implementation that fuses k computation, key compression,
@@ -155,10 +156,7 @@ def compress_k_complete_kernel_new(
             y = new_chunk_idx * kernel_stride + history_compress * k_stride
 
             # Use nested if instead of continue (Triton doesn't support continue)
-            if y < token_table_cols:
-                # Read k_indices from token_table
-                k_indices = tl.load(token_table_ptr + batch_idx * token_table_cols + y).to(tl.int32)
-
+            if y < token_table_cols * page_size:
                 # Compute y index in compressed_k_table for new_compressed_k_indices
                 # y = new_chunk_idx + history_compress
                 compressed_table_y = new_chunk_idx + history_compress
@@ -166,38 +164,6 @@ def compress_k_complete_kernel_new(
                 if compressed_table_y < compressed_k_table_cols:
                     # Read new_compressed_k_indices from compressed_k_table
                     new_compressed_k_indices = tl.load(compressed_k_table_ptr + batch_idx * compressed_k_table_cols + compressed_table_y).to(tl.int32)
-
-                    # ====================================================================
-                    # PHASE 3: Perform mean pooling compression on k
-                    # ====================================================================
-
-                    # Accumulate over all tokens in this chunk
-                    acc = tl.zeros([head_dim], dtype=tl.float32)
-
-                    for token_offset in range(kernel_size):
-                        # Compute k_indices for this token
-                        token_y = (new_chunk_idx * kernel_stride + token_offset) + history_compress * k_stride
-
-                        # Read k_indices from token_table
-                        if token_y < token_table_cols:
-                            token_k_indices = tl.load(token_table_ptr + batch_idx * token_table_cols + token_y).to(tl.int32)
-                        else:
-                            token_k_indices = 0
-
-                        # Load k from key_cache: key_cache[token_k_indices, head_idx, :]
-                        key_base_offset = token_k_indices * head_num_k * head_dim + head_idx * head_dim
-
-                        # Vectorized load of head_dim values
-                        x = tl.load(
-                            key_cache_ptr + key_base_offset + tl.arange(0, BLOCK_SIZE),
-                            mask=tl.arange(0, BLOCK_SIZE) < head_dim,
-                            other=0.0
-                        ).to(tl.float32)
-
-                        acc += x
-
-                    # Compute mean over the chunk
-                    acc = acc / kernel_size
 
                     # ====================================================================
                     # PHASE 4: Store compressed result to key_cache (head 0 only)
@@ -213,13 +179,16 @@ def compress_k_complete_kernel_new(
 
                             for token_offset in range(kernel_size):
                                 token_y = (new_chunk_idx * kernel_stride + token_offset) + history_compress * k_stride
+                                token_y_page_id = token_y // page_size
+                                token_y_in_page = token_y % page_size
 
-                                if token_y < token_table_cols:
-                                    token_k_indices = tl.load(token_table_ptr + batch_idx * token_table_cols + token_y).to(tl.int32)
+                                if token_y < token_table_cols * page_size:
+                                    page_k_indices = tl.load(token_table_ptr + batch_idx * token_table_cols + token_y_page_id).to(tl.int32)
                                 else:
-                                    token_k_indices = 0
+                                    page_k_indices = 0
 
-                                key_base_offset = token_k_indices * head_num_k * head_dim + h * head_dim
+                                # primary key_cache layout: [num_blocks, head_num_k, page_size, head_dim]
+                                key_base_offset = page_k_indices * page_size * head_num_k * head_dim + h * page_size * head_dim + token_y_in_page * head_dim
 
                                 x = tl.load(
                                     key_cache_ptr + key_base_offset + tl.arange(0, BLOCK_SIZE),
@@ -297,6 +266,7 @@ def compress_k_complete_kernel_new_padded(
     kernel_stride: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
     max_grid_chunks: tl.constexpr,
+    page_size: tl.constexpr,
 ):
     """
     Padded layout version: stores compressed keys in batch-major order.
@@ -397,38 +367,11 @@ def compress_k_complete_kernel_new_padded(
             y = new_chunk_idx * kernel_stride + history_compress * k_stride
 
             # Use nested if instead of continue (Triton doesn't support continue)
-            if y < token_table_cols:
-                k_indices = tl.load(token_table_ptr + batch_idx * token_table_cols + y).to(tl.int32)
+            if y < token_table_cols * page_size:
                 compressed_table_y = new_chunk_idx + history_compress
 
                 if compressed_table_y < compressed_k_table_cols:
                     new_compressed_k_indices = tl.load(compressed_k_table_ptr + batch_idx * compressed_k_table_cols + compressed_table_y).to(tl.int32)
-
-                    # ====================================================================
-                    # PHASE 3: Perform mean pooling compression on k
-                    # ====================================================================
-
-                    acc = tl.zeros([head_dim], dtype=tl.float32)
-
-                    for token_offset in range(kernel_size):
-                        token_y = (new_chunk_idx * kernel_stride + token_offset) + history_compress * k_stride
-
-                        if token_y < token_table_cols:
-                            token_k_indices = tl.load(token_table_ptr + batch_idx * token_table_cols + token_y).to(tl.int32)
-                        else:
-                            token_k_indices = 0
-
-                        key_base_offset = token_k_indices * head_num_k * head_dim + head_idx * head_dim
-
-                        x = tl.load(
-                            key_cache_ptr + key_base_offset + tl.arange(0, BLOCK_SIZE),
-                            mask=tl.arange(0, BLOCK_SIZE) < head_dim,
-                            other=0.0
-                        ).to(tl.float32)
-
-                        acc += x
-
-                    acc = acc / kernel_size
 
                     # ====================================================================
                     # PHASE 4: Store compressed result to key_cache (head 0 only)
@@ -442,13 +385,16 @@ def compress_k_complete_kernel_new_padded(
 
                             for token_offset in range(kernel_size):
                                 token_y = (new_chunk_idx * kernel_stride + token_offset) + history_compress * k_stride
+                                token_y_page_id = token_y // page_size
+                                token_y_in_page = token_y % page_size
 
-                                if token_y < token_table_cols:
-                                    token_k_indices = tl.load(token_table_ptr + batch_idx * token_table_cols + token_y).to(tl.int32)
+                                if token_y < token_table_cols * page_size:
+                                    page_k_indices = tl.load(token_table_ptr + batch_idx * token_table_cols + token_y_page_id).to(tl.int32)
                                 else:
-                                    token_k_indices = 0
+                                    page_k_indices = 0
 
-                                key_base_offset = token_k_indices * head_num_k * head_dim + h * head_dim
+                                # key_cache layout: [num_blocks, head_num_k, page_size, head_dim]
+                                key_base_offset = page_k_indices * page_size * head_num_k * head_dim + h * page_size * head_dim + token_y_in_page * head_dim
 
                                 x = tl.load(
                                     key_cache_ptr + key_base_offset + tl.arange(0, BLOCK_SIZE),
