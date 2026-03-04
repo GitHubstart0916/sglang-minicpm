@@ -406,6 +406,10 @@ def alloc_for_extend(
     extend_lens_cpu = torch.tensor(batch.extend_lens, dtype=torch.int64)
     prefix_lens_device = prefix_lens_cpu.to(batch.device, non_blocking=True)
     extend_lens_device = extend_lens_cpu.to(batch.device, non_blocking=True)
+    k1_prefix_lens_cpu = torch.tensor(batch.k1_prefix_lens, dtype=torch.int64)
+    k1_prefix_lens_device = k1_prefix_lens_cpu.to(batch.device, non_blocking=True)
+    k2_prefix_lens_cpu = torch.tensor(batch.k2_prefix_lens, dtype=torch.int64)
+    k2_prefix_lens_device = k2_prefix_lens_cpu.to(batch.device, non_blocking=True)
 
     # Allocate req slots
     req_pool_indices = alloc_req_slots(
@@ -437,6 +441,34 @@ def alloc_for_extend(
             last_loc=torch.cat(last_loc),
             extend_num_tokens=batch.extend_num_tokens,
         )
+        if batch.token_sum_sparse_k1 > 0:
+            last_loc = [
+                (t[-1:] if len(t) > 0 else torch.tensor([-1], device=batch.device))
+                for t in prefix_k1_tensors
+            ]
+            sparse_k1_loc = alloc_paged_token_slots_extend(
+                tree_cache=batch.tree_cache,
+                prefix_lens=k1_prefix_lens_device,
+                prefix_lens_cpu=k1_prefix_lens_cpu,
+                seq_lens=batch.k1_seq_lens,
+                seq_lens_cpu=batch.k1_seq_lens_cpu,
+                last_loc=torch.cat(last_loc),
+                extend_num_tokens=batch.token_sum_sparse_k1,
+            )
+        if batch.token_sum_sparse_k2 > 0:
+            last_loc = [
+                (t[-1:] if len(t) > 0 else torch.tensor([-1], device=batch.device))
+                for t in prefix_k2_tensors
+            ]
+            sparse_k2_loc = alloc_paged_token_slots_extend(
+                tree_cache=batch.tree_cache,
+                prefix_lens=k2_prefix_lens_device,
+                prefix_lens_cpu=k2_prefix_lens_cpu,
+                seq_lens=batch.k2_seq_lens,
+                seq_lens_cpu=batch.k2_seq_lens_cpu,
+                last_loc=torch.cat(last_loc),
+                extend_num_tokens=batch.token_sum_sparse_k2,
+            )
 
     # Write to req_to_token_pool
     write_cache_indices(
@@ -533,6 +565,28 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> Tuple[torch.Te
             last_loc=last_loc,
             token_per_req=token_per_req,
         )
+        if batch.token_sum_sparse_k1 > 0:
+            last_loc = batch.req_to_token_pool.req_to_token[
+                batch.req_pool_indices, batch.k1_seq_lens - 1
+            ]
+            sparse_k1_loc = alloc_paged_token_slots_decode(
+                tree_cache=batch.tree_cache,
+                seq_lens=batch.k1_seq_lens,
+                seq_lens_cpu=batch.k1_seq_lens_cpu,
+                last_loc=last_loc,
+                token_per_req=token_per_req,
+            )
+        if batch.token_sum_sparse_k2 > 0:
+            last_loc = batch.req_to_token_pool.req_to_token[
+                batch.req_pool_indices, batch.k2_seq_lens - 1
+            ]
+            sparse_k2_loc = alloc_paged_token_slots_decode(
+                tree_cache=batch.tree_cache,
+                seq_lens=batch.k2_seq_lens,
+                seq_lens_cpu=batch.k2_seq_lens_cpu,
+                last_loc=last_loc,
+                token_per_req=token_per_req,
+            )
 
     # Write to req_to_token_pool
     if batch.model_config.is_encoder_decoder:

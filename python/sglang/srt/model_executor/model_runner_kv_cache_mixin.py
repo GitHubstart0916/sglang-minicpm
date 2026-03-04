@@ -571,7 +571,8 @@ class ModelRunnerKVCacheMixin:
                     full_attention_layer_ids=(
                         [0] if self.is_draft_worker else config.full_attention_layer_ids
                     ),
-                    enable_kvcache_transpose=False,
+                    # for minicpm_sparse_attention, kvcache layout is [num_pages, num_heads, page_size, head_size]
+                    enable_kvcache_transpose=self.model_config.has_sparse_attention,
                     device=self.device,
                     mamba_pool=self.req_to_token_pool.mamba_pool,
                     enable_memory_saver=self.server_args.enable_memory_saver,

@@ -1329,6 +1329,16 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     cache_seqlens_int32_stage1_cpu: Optional[torch.Tensor] = None
 
+    # For paged cache allocation
+    k1_prefix_lens: List[int] = None
+    k1_extend_lens: List[int] = None
+    k2_prefix_lens: List[int] = None
+    k2_extend_lens: List[int] = None
+    k1_seq_lens: torch.Tensor = None  # shape: [b], int64
+    k1_seq_lens_cpu: torch.Tensor = None  # shape: [b], int64
+    k2_seq_lens: torch.Tensor = None  # shape: [b], int64
+    k2_seq_lens_cpu: torch.Tensor = None  # shape: [b], int64    
+
     @classmethod
     def init_new(
         cls,
@@ -1527,6 +1537,22 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             self.token_sum_sparse_k2 = token_sum_sparse_k2
             self.token_num_sparse_k1_cpu = torch.tensor(token_num_sparse_k1, dtype=torch.int64)
             self.token_num_sparse_k2_cpu = torch.tensor(token_num_sparse_k2, dtype=torch.int64)
+            self.k1_prefix_lens = token_num_sparse_k1_prefix
+            self.k1_extend_lens = token_num_sparse_k1
+            self.k2_prefix_lens = token_num_sparse_k2_prefix
+            self.k2_extend_lens = token_num_sparse_k2
+            k1_seq_lens_tensor = torch.tensor(token_num_sparse_k1_total, dtype=torch.int64).to(
+                self.device, non_blocking=True
+            )
+            k1_seq_lens_cpu = torch.tensor(token_num_sparse_k1_total, dtype=torch.int64)
+            self.k1_seq_lens = k1_seq_lens_tensor
+            self.k1_seq_lens_cpu = k1_seq_lens_cpu
+            k2_seq_lens_tensor = torch.tensor(token_num_sparse_k2_total, dtype=torch.int64).to(
+                self.device, non_blocking=True
+            )
+            k2_seq_lens_cpu = torch.tensor(token_num_sparse_k2_total, dtype=torch.int64)
+            self.k2_seq_lens = k2_seq_lens_tensor
+            self.k2_seq_lens_cpu = k2_seq_lens_cpu
 
         # Allocate memory
         out_cache_loc, sparse_k1_loc, sparse_k2_loc, req_pool_indices_tensor, req_pool_indices = alloc_for_extend(
@@ -1687,6 +1713,33 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             self,
             self.model_config.vocab_size,
         )
+
+        if self.model_config.has_sparse_attention:
+            topk = self.model_config.sparse_topk
+            block_size = self.model_config.sparse_block_size
+            window_size = self.model_config.sparse_window_size
+            sparse_topk = topk + (window_size // block_size)
+            num_sparse_topk_tokens = block_size * sparse_topk
+            all_sparse_cache_seqlens = []
+
+            for i, seq_len_cpu in enumerate(self.seq_lens_cpu):
+                token_pos_cpu = torch.arange(seq_len_cpu, dtype=torch.int32)[prefix_lens[i]:] + 1
+                mod_block_size_cpu = token_pos_cpu % block_size
+                sparse_cache_seqlens_cpu_t = torch.where(
+                    mod_block_size_cpu == 0,
+                    num_sparse_topk_tokens,
+                    (sparse_topk - 1) * block_size + mod_block_size_cpu
+                )
+                sparse_cache_seqlens_cpu = torch.where(
+                    token_pos_cpu <= num_sparse_topk_tokens,
+                    token_pos_cpu,
+                    sparse_cache_seqlens_cpu_t
+                )
+                all_sparse_cache_seqlens.append(sparse_cache_seqlens_cpu)
+
+            sparse_cache_seqlens_cpu = torch.cat(all_sparse_cache_seqlens, dim=0)
+            self.sparse_cache_seqlens_int32_cpu = torch.repeat_interleave(sparse_cache_seqlens_cpu, 2)
+            self.sparse_cu_seqlens_k_cpu = F.pad(torch.cumsum(self.sparse_cache_seqlens_int32_cpu, dim=0, dtype=torch.int32), (1, 0))
 
     def _mamba_radix_cache_v2_req_prepare_for_extend(
         self,
@@ -1992,6 +2045,20 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             self.token_sum_sparse_k2 = token_sum_sparse_k2
             self.token_num_sparse_k1_cpu = torch.tensor(token_num_sparse_k1, dtype=torch.int64)
             self.token_num_sparse_k2_cpu = torch.tensor(token_num_sparse_k2, dtype=torch.int64)
+            token_num_sparse_k1_total = [((seq_lens_next[batch_idx] - kernel_size) // kernel_stride + 1 if seq_lens_next[batch_idx] >= kernel_size else 0) for batch_idx in range(bs)]
+            k1_seq_lens_tensor = torch.tensor(token_num_sparse_k1_total, dtype=torch.int64).to(
+                self.device, non_blocking=True
+            )
+            k1_seq_lens_cpu = torch.tensor(token_num_sparse_k1_total, dtype=torch.int64)
+            self.k1_seq_lens = k1_seq_lens_tensor
+            self.k1_seq_lens_cpu = k1_seq_lens_cpu
+            token_num_sparse_k2_total = [((seq_lens_next[batch_idx] - kernel_size * 4) // (kernel_stride * 4) + 1 if seq_lens_next[batch_idx] >= kernel_size * 4 else 0) for batch_idx in range(bs)]
+            k2_seq_lens_tensor = torch.tensor(token_num_sparse_k2_total, dtype=torch.int64).to(
+                self.device, non_blocking=True
+            )
+            k2_seq_lens_cpu = torch.tensor(token_num_sparse_k2_total, dtype=torch.int64)
+            self.k2_seq_lens = k2_seq_lens_tensor
+            self.k2_seq_lens_cpu = k2_seq_lens_cpu
 
         # Allocate memory
         self.out_cache_loc, self.sparse_k1_loc, self.sparse_k2_loc = alloc_for_decode(self, token_per_req=1)
