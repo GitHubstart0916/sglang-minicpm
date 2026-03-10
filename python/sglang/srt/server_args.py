@@ -136,6 +136,7 @@ ATTENTION_BACKEND_CHOICES = [
     # Other platforms
     "intel_amx",
     "ascend",
+    "minicpm_ascend",
     "intel_xpu",
 ]
 

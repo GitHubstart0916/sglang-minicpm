@@ -1310,6 +1310,9 @@ class HybridLinearKVPool(KVCache):
         kv_lora_rank: int = None,
         qk_rope_head_dim: int = None,
     ):
+        print("===HybridLinearKVPool===")
+        print("enable_kvcache_transpose")
+        print(enable_kvcache_transpose)
         self.size = size
         self.dtype = dtype
         self.device = device
@@ -1332,9 +1335,13 @@ class HybridLinearKVPool(KVCache):
             if _is_npu:
                 from sglang.srt.hardware_backend.npu.memory_pool_npu import (
                     NPUMHATokenToKVPool,
+                    NPUMHATransposedTokenToKVPool,
                 )
 
-                TokenToKVPoolClass = NPUMHATokenToKVPool
+                if enable_kvcache_transpose:
+                    TokenToKVPoolClass = NPUMHATransposedTokenToKVPool
+                else:
+                    TokenToKVPoolClass = NPUMHATokenToKVPool
 
             self.full_kv_pool = TokenToKVPoolClass(
                 size=size,

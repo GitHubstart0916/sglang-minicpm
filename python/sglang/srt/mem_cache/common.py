@@ -406,10 +406,6 @@ def alloc_for_extend(
     extend_lens_cpu = torch.tensor(batch.extend_lens, dtype=torch.int64)
     prefix_lens_device = prefix_lens_cpu.to(batch.device, non_blocking=True)
     extend_lens_device = extend_lens_cpu.to(batch.device, non_blocking=True)
-    k1_prefix_lens_cpu = torch.tensor(batch.k1_prefix_lens, dtype=torch.int64)
-    k1_prefix_lens_device = k1_prefix_lens_cpu.to(batch.device, non_blocking=True)
-    k2_prefix_lens_cpu = torch.tensor(batch.k2_prefix_lens, dtype=torch.int64)
-    k2_prefix_lens_device = k2_prefix_lens_cpu.to(batch.device, non_blocking=True)
 
     # Allocate req slots
     req_pool_indices = alloc_req_slots(
@@ -442,6 +438,8 @@ def alloc_for_extend(
             extend_num_tokens=batch.extend_num_tokens,
         )
         if batch.token_sum_sparse_k1 > 0:
+            k1_prefix_lens_cpu = torch.tensor(batch.k1_prefix_lens, dtype=torch.int64)
+            k1_prefix_lens_device = k1_prefix_lens_cpu.to(batch.device, non_blocking=True)
             last_loc = [
                 (t[-1:] if len(t) > 0 else torch.tensor([-1], device=batch.device))
                 for t in prefix_k1_tensors
@@ -456,6 +454,8 @@ def alloc_for_extend(
                 extend_num_tokens=batch.token_sum_sparse_k1,
             )
         if batch.token_sum_sparse_k2 > 0:
+            k2_prefix_lens_cpu = torch.tensor(batch.k2_prefix_lens, dtype=torch.int64)
+            k2_prefix_lens_device = k2_prefix_lens_cpu.to(batch.device, non_blocking=True)
             last_loc = [
                 (t[-1:] if len(t) > 0 else torch.tensor([-1], device=batch.device))
                 for t in prefix_k2_tensors

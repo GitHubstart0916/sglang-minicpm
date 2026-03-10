@@ -429,8 +429,10 @@ class ModelRunnerKVCacheMixin:
 
         # Initialize token_to_kv_pool
         is_nsa_model = is_deepseek_nsa(self.model_config.hf_config)
-        if self.server_args.attention_backend == "ascend":
+        if self.server_args.attention_backend == "ascend" or self.server_args.attention_backend == "minicpm_ascend":
+            print("===ascend init_memory_pool===")
             if self.use_mla_backend:
+                print("===use_mla_backend===")
                 from sglang.srt.hardware_backend.npu.memory_pool_npu import (
                     NPUMLATokenToKVPool,
                 )
@@ -448,25 +450,74 @@ class ModelRunnerKVCacheMixin:
                     start_layer=self.start_layer,
                     end_layer=self.end_layer,
                 )
-            else:
-                from sglang.srt.hardware_backend.npu.memory_pool_npu import (
-                    NPUMHATokenToKVPool,
-                )
-
-                self.token_to_kv_pool = NPUMHATokenToKVPool(
-                    self.max_total_num_tokens,
+            elif config := self.mambaish_config:
+                print("===hybrid linear kv pool===")
+                extra_args = {}
+                if self.use_mla_backend:
+                    extra_args = {
+                        "kv_lora_rank": self.model_config.kv_lora_rank,
+                        "qk_rope_head_dim": self.model_config.qk_rope_head_dim,
+                    }
+                self.token_to_kv_pool = HybridLinearKVPool(
                     page_size=self.page_size,
+                    size=self.max_total_num_tokens,
                     dtype=self.kv_cache_dtype,
                     head_num=self.model_config.get_num_kv_heads(
                         get_attention_tp_size()
                     ),
                     head_dim=self.model_config.head_dim,
-                    layer_num=self.num_effective_layers,
+                    # if draft worker, we only need 1 attention layer's kv pool
+                    full_attention_layer_ids=(
+                        [0] if self.is_draft_worker else config.full_attention_layer_ids
+                    ),
+                    # for minicpm_sparse_attention, kvcache layout is [num_pages, num_heads, page_size, head_size]
+                    enable_kvcache_transpose=self.model_config.has_sparse_attention,
                     device=self.device,
+                    mamba_pool=self.req_to_token_pool.mamba_pool,
                     enable_memory_saver=self.server_args.enable_memory_saver,
-                    start_layer=self.start_layer,
-                    end_layer=self.end_layer,
+                    use_mla=self.use_mla_backend,
+                    **extra_args,
                 )
+            else:
+                from sglang.srt.hardware_backend.npu.memory_pool_npu import (
+                    NPUMHATokenToKVPool,
+                    NPUMHATransposedTokenToKVPool
+                )
+                
+                print("===ln 484===")
+                print("has_sparse_attention")
+                print(self.model_config.has_sparse_attention)
+                if self.model_config.has_sparse_attention:
+                    print("===NPUMHATransposedTokenToKVPool==")
+                    self.token_to_kv_pool = NPUMHATransposedTokenToKVPool(
+                        self.max_total_num_tokens,
+                        page_size=self.page_size,
+                        dtype=self.kv_cache_dtype,
+                        head_num=self.model_config.get_num_kv_heads(
+                            get_attention_tp_size()
+                        ),
+                        head_dim=self.model_config.head_dim,
+                        layer_num=self.num_effective_layers,
+                        device=self.device,
+                        enable_memory_saver=self.server_args.enable_memory_saver,
+                        start_layer=self.start_layer,
+                        end_layer=self.end_layer,
+                    )   
+                else:
+                    self.token_to_kv_pool = NPUMHATokenToKVPool(
+                        self.max_total_num_tokens,
+                        page_size=self.page_size,
+                        dtype=self.kv_cache_dtype,
+                        head_num=self.model_config.get_num_kv_heads(
+                            get_attention_tp_size()
+                        ),
+                        head_dim=self.model_config.head_dim,
+                        layer_num=self.num_effective_layers,
+                        device=self.device,
+                        enable_memory_saver=self.server_args.enable_memory_saver,
+                        start_layer=self.start_layer,
+                        end_layer=self.end_layer,
+                    )
         elif self.use_mla_backend and is_nsa_model:
             self.token_to_kv_pool = NSATokenToKVPool(
                 self.max_total_num_tokens,
@@ -624,6 +675,7 @@ class ModelRunnerKVCacheMixin:
         if self.token_to_kv_pool_allocator is None:
             if _is_npu and (
                 self.server_args.attention_backend == "ascend"
+                or self.server_args.attention_backend == "minicpm_ascend"
                 or self.hybrid_gdn_config is not None
             ):
                 from sglang.srt.hardware_backend.npu.allocator_npu import (

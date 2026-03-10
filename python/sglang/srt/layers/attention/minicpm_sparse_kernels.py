@@ -2,7 +2,8 @@ import torch
 import triton
 import triton.language as tl
 from functools import lru_cache
-
+import torch.nn.functional as F
+import math
 
 # TODO. Now only page size == 1 is supported. Consider extend to page size > 1
 @triton.jit
@@ -657,3 +658,343 @@ def convert_sparse_page_table_to_flashinfer(
             kv_indices,
             kv_last_page_len,
         )
+
+def get_sparse_block_table(
+    topk_idx, block_table, token_to_bs, 
+    token_pos_in_bs, seqlen_k, topk, page_size,
+    sparse_block_size):
+    
+    token_num = topk_idx.shape[1]
+    max_num_blocks = block_table.shape[1]
+    head_group = topk_idx.shape[0]
+    num_pages_per_block = sparse_block_size // page_size
+    grid = (token_num,)
+    out_block_table = torch.zeros((token_num, head_group, topk * num_pages_per_block),
+                                  device=topk_idx.device,
+                                  dtype=topk_idx.dtype)
+
+    get_sparse_block_table_kernel[grid](
+        topk_idx, block_table,
+        token_to_bs, token_pos_in_bs,
+        seqlen_k, out_block_table,
+        max_num_blocks, token_num,
+        page_size, num_pages_per_block,
+        topk, head_group, sparse_block_size
+    )
+    return out_block_table
+
+@triton.jit
+def get_sparse_block_table_kernel(
+    topk_idx_ptr, block_table_ptr,
+    token_to_bs_ptr, token_pos_in_bs_ptr,
+    seqlen_k_ptr, out_ptr,
+    max_num_blocks, token_num,
+    page_size: tl.constexpr,
+    num_pages_per_block: tl.constexpr,
+    TOPK: tl.constexpr, 
+    HEAD_GROUP: tl.constexpr, 
+    SPARSE_BLOCK_SIZE: tl.constexpr
+):
+    token_idx = tl.program_id(0)
+    if token_idx >= token_num:
+        return
+
+    bs = tl.load(token_to_bs_ptr + token_idx)
+    pos_in_bs = tl.load(token_pos_in_bs_ptr + token_idx)
+    seqlen_k_bs = tl.load(seqlen_k_ptr + bs)
+
+    page_offsets = tl.arange(0, num_pages_per_block)
+
+    # Unroll head_group loop
+    for head_group_idx in range(HEAD_GROUP):
+        # Unroll topk loop
+        for topk_idx_in_head in range(TOPK):
+            # sparse block idx
+            sparse_block_ptr = topk_idx_ptr + head_group_idx * token_num * TOPK + token_idx * TOPK + topk_idx_in_head
+            sparse_block_idx = tl.load(sparse_block_ptr)
+
+            out_base = (token_idx * HEAD_GROUP * TOPK * num_pages_per_block
+                        + head_group_idx * TOPK * num_pages_per_block
+                        + topk_idx_in_head * num_pages_per_block)
+
+            # mask for negative sparse block
+            mask_valid_block = sparse_block_idx >= 0
+
+            # vectorized page calculation
+            token_idx_in_batch = sparse_block_idx * SPARSE_BLOCK_SIZE + page_offsets * page_size
+            page_idx_in_batch = token_idx_in_batch // page_size
+
+            # mask for valid page
+            mask_page = (token_idx_in_batch < seqlen_k_bs) & (token_idx_in_batch < pos_in_bs)
+            mask = mask_valid_block & mask_page
+
+            # vectorized load, store
+            page_vals = tl.load(block_table_ptr + bs * max_num_blocks + page_idx_in_batch, mask=mask, other=0)
+            page_vals = HEAD_GROUP * page_vals + head_group_idx
+            tl.store(out_ptr + out_base + page_offsets, page_vals, mask=mask)
+            
+def infllmv2_attn_stage1_prefill_ascend(
+    q, k, cu_seqlen_q, cu_seqlen_k,
+    max_seqlen_k, kernel_stride, causal = True,
+):
+    """
+    q: [tokens_q, num_heads, head_dim]
+    k: [tokens_k, nheads_k, head_dim]
+    cu_seqlen_q: [batch+1], cumulative sequence length of q
+    cu_seqlen_k: [batch+1], cumulative sequence length of k
+    max_seqlen_k: int, max sequence length of k
+    kernel_stride: int, kernel stride when computing k
+    """
+    total_tokens, nheads, head_dim = q.shape
+    batch_size = len(cu_seqlen_q) - 1
+    nheads_k = k.shape[1]
+    nheads_per_group = nheads // nheads_k
+    
+    output = torch.zeros(nheads_k, total_tokens, max_seqlen_k, device=q.device, dtype=q.dtype)
+    scale = 1.0 / math.sqrt(head_dim)
+
+    for b in range(batch_size):
+        start_q = cu_seqlen_q[b]
+        end_q = cu_seqlen_q[b+1]
+        start_k = cu_seqlen_k[b]
+        end_k = cu_seqlen_k[b+1]
+
+        q_b = q[start_q:end_q]         # [seq_len_q_b, nheads, head_dim]
+        k_b = k[start_k:end_k]         # [seq_len_k_b, nheads_k, head_dim]
+        k_b = k_b.repeat_interleave(nheads_per_group, dim=1).reshape(-1, nheads, head_dim) # [seq_len_k_b, nheads, head_dim]
+        
+        seq_len_q_b = end_q - start_q
+        seq_len_k_b = end_k - start_k
+
+        q_b_t = q_b.transpose(0,1)     # [nheads, seq_len_q, head_dim]
+        k_b_t = k_b.transpose(0,1)     # [nheads, seq_len_k, head_dim]
+        
+        # Q·K^T
+        scores = torch.bmm(q_b_t, k_b_t.transpose(1,2)) * scale  # [nheads, seq_len_q, seq_len_k]
+
+        # causal mask
+        if causal:
+            q_idx = torch.arange(seq_len_q_b, device=scores.device)
+            q_compress_idx = ((q_idx - kernel_stride + 1) // kernel_stride) + seq_len_k_b - (seq_len_q_b - kernel_stride + 1) // kernel_stride
+            q_compress_idx = q_compress_idx.clamp(0, seq_len_k_b)
+            mask = [[0] * q_compress_idx[i] + [1] * (seq_len_k_b - q_compress_idx[i]) for i in range(seq_len_q_b)]
+            mask = torch.tensor(mask, dtype=torch.bool, device=scores.device)
+            scores = scores.masked_fill(mask, float('-inf'))
+
+        # softmax
+        probs = F.softmax(scores, dim=-1)  # [nheads, seq_len_q, seq_len_k]
+        
+        # nheads_per_group reduction
+        probs = probs.reshape(nheads_k, nheads_per_group, seq_len_q_b, seq_len_k_b).sum(dim=1)
+        
+        probs = torch.where(torch.isnan(probs), 0, probs)
+
+        output[:, start_q:end_q, :seq_len_k_b] = probs
+
+    return output
+
+# def infllmv2_attn_stage1_prefill_ascend(
+#     q, k, cu_seqlen_q, cu_seqlen_k,
+#     max_seqlen_k, kernel_stride, causal = True,
+# ):
+#     """
+#     q: [tokens_q, num_heads, head_dim]
+#     k: [tokens_k, nheads_k, head_dim]
+#     cu_seqlen_q: [batch+1], cumulative sequence length of q
+#     cu_seqlen_k: [batch+1], cumulative sequence length of k
+#     max_seqlen_k: int, max sequence length of k
+#     kernel_stride: int, kernel stride when computing k
+#     """
+#     print(q)
+#     print(k)
+#     total_tokens, nheads, head_dim = q.shape
+#     batch_size = len(cu_seqlen_q) - 1
+#     nheads_k = k.shape[1]
+#     nheads_per_group = nheads // nheads_k
+#     q = q.reshape(total_tokens, nheads_k, nheads_per_group, head_dim)
+#     q = q.transpose(1, 2).reshape(total_tokens * nheads_per_group, nheads_k, head_dim).contiguous()
+    
+#     output = torch.zeros((nheads_k, total_tokens, max_seqlen_k), device=q.device, dtype=q.dtype)
+#     print(output.shape)
+
+#     for b in range(batch_size):
+#         start_q = cu_seqlen_q[b]
+#         end_q = cu_seqlen_q[b+1]
+#         start_k = cu_seqlen_k[b]
+#         end_k = cu_seqlen_k[b+1]
+
+#         q_b = q[start_q:end_q]         # [seq_len_q_b, nheads_k, head_dim]
+#         k_b = k[start_k:end_k]         # [seq_len_k_b, nheads_k, head_dim]
+
+#         seq_len_q_b = end_q - start_q
+#         seq_len_k_b = end_k - start_k
+
+#         q_b_t = q_b.transpose(0,1)     # [nheads_k, seq_len_q, head_dim]
+#         k_b_t = k_b.transpose(0,1)     # [nheads_k, seq_len_k, head_dim]
+        
+#         # Q·K^T
+#         scores = torch.bmm(q_b_t, k_b_t.transpose(1,2))  # [nheads_k, seq_len_q, seq_len_k]
+
+#         # causal mask
+#         if causal:
+#             q_idx = torch.arange(seq_len_q_b, device=scores.device)
+#             q_compress_idx = ((q_idx - kernel_stride + 1) // kernel_stride) + seq_len_k_b - (seq_len_q_b - kernel_stride + 1) // kernel_stride
+#             q_compress_idx = q_compress_idx.clamp(0, seq_len_k_b)
+#             mask = [[0] * q_compress_idx[i] + [1] * (seq_len_k_b - q_compress_idx[i]) for i in range(seq_len_q_b)]
+#             mask = torch.tensor(mask, dtype=torch.bool, device=scores.device)
+#             scores = scores.masked_fill(~mask, float('-inf'))
+
+#         # softmax
+#         probs = F.softmax(scores, dim=-1)  # [nheads, seq_len_q, seq_len_k]
+        
+#         # nheads_per_group reduction
+#         probs = probs.reshape(nheads_k, seq_len_q_b // nheads_per_group, nheads_per_group, seq_len_k_b).sum(dim=2)
+        
+#         probs = torch.where(torch.isnan(probs), 0, probs)
+
+#         print("probs shape")
+#         print(probs.shape)
+#         print(start_q)
+#         print(end_q)
+#         print(nheads_per_group)
+#         print(start_q // nheads_per_group)
+#         print(end_q // nheads_per_group)
+#         print(seq_len_k_b)
+#         print(probs)
+#         output[:, start_q//nheads_per_group:end_q//nheads_per_group, :seq_len_k_b] = probs
+
+#     return output
+
+@triton.jit
+def max_pooling_1d_varlen_kernel(
+    input_ptr,            # [num_heads, total_q, max_k]
+    output_ptr,           # [num_heads, total_q, out_len]
+    cu_seqlens_q_ptr,     # [batch+1]
+    cu_seqlens_k_ptr,     # [batch+1]
+    cache_lens_ptr,       # [batch_size]
+    batch_size,
+    max_seqlen_k,
+    out_len,
+    num_heads: tl.constexpr,
+    kernel_size: tl.constexpr,
+    stride: tl.constexpr,
+    padding: tl.constexpr,
+    block_size: tl.constexpr,
+    local_blocks: tl.constexpr,
+    init_blocks: tl.constexpr,
+):
+    # grid: (total_q, num_heads)
+    bidq_global = tl.program_id(0)  # query index across all batches
+    bidh = tl.program_id(1)         # head index
+
+    # find batch_idx
+    batch_idx = 0
+    q_start = 0
+    q_end = 0
+    k_start = 0
+    k_end = 0
+    for b in range(batch_size):
+        q_start = tl.load(cu_seqlens_q_ptr + b)
+        q_end = tl.load(cu_seqlens_q_ptr + b + 1)
+        k_start = tl.load(cu_seqlens_k_ptr + b)
+        k_end = tl.load(cu_seqlens_k_ptr + b + 1)
+        cond = (bidq_global >= q_start) & (bidq_global < q_end)
+        batch_idx = tl.where(cond, b, batch_idx)
+
+    # Local query index within the batch
+    bidq_local = bidq_global - q_start
+    seqlen_q = q_end - q_start
+    seqlen_k = k_end - k_start
+    # Skip if this thread is outside the sequence length
+    if bidq_local >= seqlen_q:
+        return
+
+    # Calculate input and output pointers
+    # Input is packed: [num_heads, total_q, max_k]
+    # We need to access the k values for this specific query
+    total_q_all = tl.load(cu_seqlens_q_ptr + batch_size)
+    in_ptr = input_ptr + bidh * total_q_all * max_seqlen_k + bidq_global * max_seqlen_k
+    out_ptr = output_ptr + bidh * total_q_all * out_len + bidq_global * out_len
+
+    # Calculate query block index for masking
+    cache_len = tl.load(cache_lens_ptr + batch_idx)
+    off_bq = (bidq_local + cache_len) // block_size
+
+    for k in range(0, out_len):
+        off_bk = k
+
+        # Check causal + local window mask based on exact criteria from transform_score
+        should_mask_inf = (off_bk < init_blocks) | ((off_bq >= off_bk) & (off_bq <= off_bk + local_blocks))
+
+        if should_mask_inf:
+            tl.store(out_ptr + k, float('inf'))
+        else:
+            start = k * stride - padding
+            end = start + kernel_size
+            start = max(start, 0)
+            end = min(end, seqlen_k)
+            
+            max_val = float('-inf')
+            if end > start:
+                idxs = start + tl.arange(0, kernel_size)
+                mask = idxs < end
+                vals = tl.load(in_ptr + idxs, mask=mask, other=float('-inf'))
+                max_val = tl.max(vals, axis=0)
+            tl.store(out_ptr + k, max_val)
+            
+def max_pooling_1d_varlen(
+    input: torch.Tensor, # [num_heads, total_q, max_k]
+    cu_seqlens_q: torch.Tensor, # [batch+1]
+    cu_seqlens_k: torch.Tensor, # [batch+1]
+    cache_lens: torch.Tensor, # [batch_size]
+    max_seqlen_k: int,
+    local_blocks: int,
+    init_blocks: int,
+    block_size: int,
+    kernel_stride: int,
+    kernel_size: int,
+) -> torch.Tensor:
+    """
+    Variable-length version of max_pooling_1d that handles packed sequences.
+    
+    Args:
+        input: Tensor of shape (num_heads, total_q, max_k) where:
+               - total_q is sum of all query sequence lengths
+               - max_k is the maximum key sequence length (padded)
+        cu_seqlens_q: Cumulative sequence lengths for queries (batch_size + 1,)
+        cu_seqlens_k: Cumulative sequence lengths for keys (batch_size + 1,)
+        cache_lens: Cache lengths for each sequence in the batch (batch_size,)
+        max_seqlen_k: Maximum context length
+        local_blocks: Number of local blocks for window attention
+        init_blocks: Number of initial blocks to mask with inf
+        block_size: Block size
+        kernel_stride: kernel_stride for pooling
+    
+    Returns:
+        output: Tensor of shape (num_heads, total_q, out_len)
+    """
+    max_seqlen_k1 = (max_seqlen_k - kernel_size) // kernel_stride + 1 if max_seqlen_k > kernel_size else 0
+    out_len = (max_seqlen_k + block_size - 1) // block_size
+    print("max_pooling")
+    print(max_seqlen_k1)
+    print(out_len)
+    
+    kernel_stride = block_size // kernel_stride
+    kernel_size = kernel_stride + 1
+    padding = 1
+    
+    batch_size = cu_seqlens_q.shape[0] - 1
+    num_heads = input.shape[0]
+    total_q = input.shape[1]
+    
+    output = torch.empty(num_heads, total_q, out_len, device=input.device, dtype=input.dtype)
+    
+    grid = (total_q, num_heads)
+    max_pooling_1d_varlen_kernel[grid](
+        input, output, cu_seqlens_q, cu_seqlens_k,
+        cache_lens, batch_size, max_seqlen_k1,
+        out_len, num_heads, kernel_size, kernel_stride,
+        padding, block_size, local_blocks, init_blocks
+    )
+    return output
+    

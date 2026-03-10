@@ -111,7 +111,7 @@ class RotaryEmbedding(MultiPlatformOp):
 
         cache = self._compute_cos_sin_cache()
         # NOTE(ByronHsu): cache needs to be in FP32 for numerical stability
-        if not _is_cuda:
+        if not _is_cuda and not _is_npu:
             cache = cache.to(dtype)
 
         if (

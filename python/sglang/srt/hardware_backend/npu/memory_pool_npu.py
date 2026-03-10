@@ -10,6 +10,8 @@ from sglang.srt.mem_cache.memory_pool import (
     get_tensor_size_bytes,
 )
 from sglang.srt.utils import get_bool_env_var
+import triton
+import triton.language as tl
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -162,6 +164,90 @@ class NPUMHATokenToKVPool(MHATokenToKVPool):
                 ),
                 slot_indices=loc,
             )
+
+class NPUMHATransposedTokenToKVPool(NPUMHATokenToKVPool):
+    # kv cache layout: [num_pages, num_heads, page_size, head_dim]
+    def set_kv_buffer(
+        self,
+        layer: "RadixAttention",
+        loc: torch.Tensor,
+        cache_k: torch.Tensor,
+        cache_v: torch.Tensor,
+        k_scale: Optional[float] = None,
+        v_scale: Optional[float] = None,
+        layer_id_override: Optional[int] = None,
+    ):
+        if layer_id_override is not None:
+            layer_id = layer_id_override
+        else:
+            layer_id = layer.layer_id
+        if cache_k.dtype != self.dtype:
+            if k_scale is not None:
+                cache_k.div_(k_scale)
+            if v_scale is not None:
+                cache_v.div_(v_scale)
+            cache_k = cache_k.to(self.dtype)
+            cache_v = cache_v.to(self.dtype)
+            
+        tokens, nhead, head_size = cache_k.shape
+        BLOCK_D = triton.next_power_of_2(head_size)
+        grid = (tokens, nhead)
+        # reshape_and_cache_kernel[grid](
+        #     cache_k,
+        #     self.k_buffer[layer_id - self.start_layer],
+        #     loc,
+        #     tokens, 
+        #     nhead, 
+        #     head_size,
+        #     self.page_size,
+        #     cache_k.stride(0), 
+        #     cache_k.stride(1), 
+        #     cache_k.stride(2),
+        #     nhead * self.page_size * head_size,
+        #     self.page_size * head_size,
+        #     head_size,
+        #     1,
+        #     BLOCK_D=BLOCK_D,
+        # )
+        # reshape_and_cache_kernel[grid](
+        #     cache_v,
+        #     self.v_buffer[layer_id - self.start_layer],
+        #     loc,
+        #     tokens, 
+        #     nhead, 
+        #     head_size,
+        #     self.page_size,
+        #     cache_v.stride(0), 
+        #     cache_v.stride(1), 
+        #     cache_v.stride(2),
+        #     nhead * self.page_size * head_size,
+        #     self.page_size * head_size,
+        #     head_size,
+        #     1,
+        #     BLOCK_D=BLOCK_D,
+        # )
+        reshape_and_cache_kernel[grid](
+            cache_k,
+            cache_v,
+            self.k_buffer[layer_id - self.start_layer],
+            self.v_buffer[layer_id - self.start_layer],
+            loc,
+            tokens, 
+            nhead, 
+            head_size,
+            self.page_size,
+            cache_k.stride(0), 
+            cache_k.stride(1), 
+            cache_k.stride(2),
+            cache_v.stride(0), 
+            cache_v.stride(1), 
+            cache_v.stride(2),
+            nhead * self.page_size * head_size,
+            self.page_size * head_size,
+            head_size,
+            1,
+            BLOCK_D=BLOCK_D,
+        )
 
 
 class NPUMLATokenToKVPool(MLATokenToKVPool):
@@ -359,3 +445,105 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             loc.view(-1, 1),
             index_k.view(-1, 1, self.index_head_dim),
         )
+
+# @triton.jit
+# def reshape_and_cache_kernel(
+#     k_ptr,
+#     k_cache_ptr,
+#     loc_ptr,
+#     tokens, nhead, headsize,
+#     pagesize,
+#     stride_k_token, stride_k_head, stride_k_dim,
+#     stride_cache_page, stride_cache_head, stride_cache_in_page, stride_cache_dim,
+#     BLOCK_D: tl.constexpr,
+# ):
+#     token_id = tl.program_id(0)
+#     head_id  = tl.program_id(1)
+
+#     if token_id >= tokens or head_id >= nhead:
+#         return
+
+#     flat_index = tl.load(loc_ptr + token_id)
+
+#     page_id = flat_index // pagesize
+#     token_id_in_page  = flat_index % pagesize
+
+#     k_src = (
+#         k_ptr
+#         + token_id * stride_k_token
+#         + head_id  * stride_k_head
+#     )
+
+#     k_dst = (
+#         k_cache_ptr
+#         + page_id * stride_cache_page
+#         + head_id * stride_cache_head
+#         + token_id_in_page * stride_cache_in_page
+#     )
+
+#     offsets = tl.arange(0, BLOCK_D)
+#     mask = offsets < headsize
+
+#     k_val = tl.load(k_src + offsets * stride_k_dim, mask=mask)
+
+#     tl.store(k_dst + offsets * stride_cache_dim, k_val, mask=mask)
+    
+@triton.jit
+def reshape_and_cache_kernel(
+    k_ptr, v_ptr,
+    k_cache_ptr, v_cache_ptr,
+    loc_ptr,
+    tokens, nhead, headsize,
+    pagesize,
+    stride_k_token, stride_k_head, stride_k_dim,
+    stride_v_token, stride_v_head, stride_v_dim,
+    stride_cache_page, stride_cache_head, stride_cache_in_page, stride_cache_dim,
+    BLOCK_D: tl.constexpr,
+):
+    token_id = tl.program_id(0)
+    head_id  = tl.program_id(1)
+
+    if token_id >= tokens or head_id >= nhead:
+        return
+
+    flat_index = tl.load(loc_ptr + token_id)
+
+    page_id = flat_index // pagesize
+    token_id_in_page  = flat_index % pagesize
+
+    k_src = (
+        k_ptr
+        + token_id * stride_k_token
+        + head_id  * stride_k_head
+    )
+
+    v_src = (
+        v_ptr
+        + token_id * stride_v_token
+        + head_id  * stride_v_head
+    )
+
+    k_dst = (
+        k_cache_ptr
+        + page_id * stride_cache_page
+        + head_id * stride_cache_head
+        + token_id_in_page * stride_cache_in_page
+    )
+
+    v_dst = (
+        v_cache_ptr
+        + page_id * stride_cache_page
+        + head_id * stride_cache_head
+        + token_id_in_page * stride_cache_in_page
+    )
+
+    offsets = tl.arange(0, BLOCK_D)
+    mask = offsets < headsize
+
+    k_val = tl.load(k_src + offsets * stride_k_dim, mask=mask)
+
+    tl.store(k_dst + offsets * stride_cache_dim, k_val, mask=mask)
+    
+    v_val = tl.load(v_src + offsets * stride_v_dim, mask=mask)
+    
+    tl.store(v_dst + offsets * stride_cache_dim, v_val, mask=mask)

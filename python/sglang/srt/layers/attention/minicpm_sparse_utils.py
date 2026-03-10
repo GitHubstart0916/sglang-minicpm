@@ -23,7 +23,18 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import KVCache
 
 import triton
-from infllm_v2 import infllmv2_attn_stage1, max_pooling_1d_varlen
+from sglang.srt.utils import is_cuda, is_npu
+
+_is_cuda = is_cuda()
+_is_npu = is_npu()
+
+if _is_cuda:
+    from infllm_v2 import infllmv2_attn_stage1, max_pooling_1d_varlen
+if _is_npu:
+    from sglang.srt.layers.attention.minicpm_sparse_kernels import (
+        infllmv2_attn_stage1_prefill_ascend,
+        max_pooling_1d_varlen
+    )
 
 from sglang.srt.layers.attention.minicpm_sparse_kernels import (
     compress_k_complete_kernel_new,
@@ -250,6 +261,8 @@ def compress_k_core_new_padded(
 
     BLOCK_SIZE = triton.next_power_of_2(head_dim)
     grid = (batch, max_grid_chunks, head_num_k)
+    print("grid")
+    print(grid)
 
     compress_k_complete_kernel_new_padded[grid](
         key_cache,
@@ -420,7 +433,7 @@ def compressed_attention(
     cu_seqlens_k: torch.Tensor,
     cu_seqlens_k2: torch.Tensor,
     max_seqlen_q: int,
-    # max_seqlen_k: int,
+    max_seqlen_k: int,
     max_context_len: int,
     sm_scale: Optional[float] = None,
     init_blocks: int = 1,
@@ -520,34 +533,71 @@ def compressed_attention(
             torch.nan_to_num(score, nan=float("-inf"), posinf=float("-inf"), out=score)
             torch.softmax(score, dim=-1, out=score)
             score = score.reshape(kv_head, batch_size, group_size, k1_len // batch_size).sum(dim=2)
-        else:  
-            score = infllmv2_attn_stage1(
-                q.contiguous(),
-                k.contiguous(),
-                k2.contiguous(),
-                cu_seqlens_q=cu_seqlens_q_adjusted,
-                cu_seqlens_k=cu_seqlens_k,
-                cu_seqlens_v=cu_seqlens_k2,
-                max_seqlen_q=max_seqlen_q_adjusted,
-                max_seqlen_k=max_context_len // kernel_stride,
-                causal=is_prefilling
+        else:
+            if _is_cuda:
+                score = infllmv2_attn_stage1(
+                    q.contiguous(),
+                    k.contiguous(),
+                    k2.contiguous(),
+                    cu_seqlens_q=cu_seqlens_q_adjusted,
+                    cu_seqlens_k=cu_seqlens_k,
+                    cu_seqlens_v=cu_seqlens_k2,
+                    max_seqlen_q=max_seqlen_q_adjusted,
+                    max_seqlen_k=max_context_len // kernel_stride,
+                    causal=is_prefilling
+                )
+            elif _is_npu:
+                max_seqlen_k1 = (max_seqlen_k - kernel_size) // kernel_stride + 1 if max_seqlen_k > kernel_size else 0
+                score = infllmv2_attn_stage1_prefill_ascend(
+                    q,
+                    k.contiguous(),
+                    cu_seqlens_q,
+                    cu_seqlens_k,
+                    max_seqlen_k1,
+                    kernel_stride,
+                )
+            else:
+                raise NotImplementedError("infllmv2_attn_stage1 is only supported on cuda and npu")
+
+        print("score")
+        print(score.shape)
+        print(score)
+        
+        if _is_cuda:
+            block_score = max_pooling_1d_varlen(
+                score.contiguous(),
+                cu_seqlens_q,
+                cu_seqlens_k,
+                cache_lens,
+                max_seqlen_q,
+                # max_seqlen_k,
+                max_context_len,
+                local_blocks=local_blocks,
+                init_blocks=init_blocks,
+                block_size=block_size,
+                stride=kernel_stride,
+                total_q=total_q,
             )
+        elif _is_npu:
+            block_score = max_pooling_1d_varlen(
+                score.contiguous(),
+                cu_seqlens_q,
+                cu_seqlens_k,
+                cache_lens,
+                max_seqlen_k,
+                local_blocks=local_blocks,
+                init_blocks=init_blocks,
+                block_size=block_size,
+                kernel_stride=kernel_stride,
+                kernel_size=kernel_size,
+            )
+        else:
+            raise NotImplementedError("max_pooling_1d_varlen is only supported on cuda and npu")
 
-        block_score = max_pooling_1d_varlen(
-            score.contiguous(),
-            cu_seqlens_q,
-            cu_seqlens_k,
-            cache_lens,
-            max_seqlen_q,
-            # max_seqlen_k,
-            max_context_len,
-            local_blocks=local_blocks,
-            init_blocks=init_blocks,
-            block_size=block_size,
-            stride=kernel_stride,
-            total_q=total_q,
-        )
-
+        print("block_score")
+        print(block_score.shape)
+        print(block_score)
+        
         topk_idx = block_score.topk(topk, dim=-1).indices.sort(-1).values
         # Stage1 optimization: skip q_idx filtering
         # topk_idx[topk_idx > q_idx[None, :, None]] = -1
@@ -1440,7 +1490,7 @@ class SparseMetadataBuilder:
             dtype=torch.int32,
             device=base_metadata.cu_seqlens_q.device,
         )
-        token_to_bs = torch.arange(0, bs, dtype=torch.int32, device="cuda")
+        token_to_bs = torch.arange(0, bs, dtype=torch.int32, device=sparse_cu_seqlens_q.device)
         sparse_page_table = torch.zeros(
             (2 * bs, (sparse_topk * sparse_block_size + page_size - 1) // page_size),
             dtype=page_table.dtype,

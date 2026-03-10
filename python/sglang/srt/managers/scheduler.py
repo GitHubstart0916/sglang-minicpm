@@ -704,6 +704,8 @@ class Scheduler(
                 )
             else:
                 self.tree_cache = RadixCache(params)
+            print("===self.tree_cache===")
+            print(self.tree_cache)
 
         if (
             server_args.disaggregation_mode == "decode"

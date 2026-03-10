@@ -42,9 +42,14 @@ def set_default_server_args(args: "ServerArgs"):
     """
 
     # NPU only works with "ascend" attention backend for now
-    args.attention_backend = "ascend"
-    args.prefill_attention_backend = "ascend"
-    args.decode_attention_backend = "ascend"
+    if args.attention_backend == "minicpm_ascend":
+        args.attention_backend = "minicpm_ascend"
+        args.prefill_attention_backend = "minicpm_ascend"
+        args.decode_attention_backend = "minicpm_ascend"
+    else:
+        args.attention_backend = "ascend"
+        args.prefill_attention_backend = "ascend"
+        args.decode_attention_backend = "ascend"
     if args.page_size is None:
         args.page_size = 128
 

@@ -364,6 +364,7 @@ class AscendAttnBackend(AttentionBackend):
         forward_mode: ForwardMode,
         spec_info: Optional[SpecInput],
         seq_lens_cpu: Optional[torch.Tensor],
+        forward_batch: Optional[ForwardBatch]
     ):
         metadata = self.graph_metadata[bs]
         max_len = seq_lens_cpu[:bs].max().item()
@@ -1123,6 +1124,14 @@ class AscendAttnBackend(AttentionBackend):
                 else:
                     actual_seq_len_kv = self.forward_metadata.seq_lens_cpu_int
 
+                print("paged attention inputs")
+                print(k_cache.shape)
+                print(v_cache.shape)
+                print(query.shape)
+                print(attn_output.shape)
+                print(self.forward_metadata.block_tables.shape)
+                print(actual_seq_len_kv)
+                
                 torch_npu._npu_paged_attention(
                     query=query,
                     key_cache=k_cache,
@@ -1292,6 +1301,14 @@ class AscendAttnBackend(AttentionBackend):
                     device=query.device,
                 )
 
+                print("paged attention inputs")
+                print(k_cache.shape)
+                print(v_cache.shape)
+                print(query.shape)
+                print(attn_output.shape)
+                print(self.forward_metadata.block_tables.shape)
+                print(self.forward_metadata.seq_lens_cpu_int)
+                
                 torch_npu._npu_paged_attention(
                     query=query,
                     key_cache=k_cache,

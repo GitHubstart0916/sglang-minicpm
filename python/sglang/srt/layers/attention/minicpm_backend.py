@@ -851,7 +851,7 @@ class MiniCPMSparseBackend(AttentionBackend):
                 compressed_cu_seqlens,
                 compressed_cu_seqlens2,
                 max_seqlen_in_batch_q,
-                # self.max_context_len // self.kernel_size,
+                max_seqlen_in_batch_k,
                 self.max_context_len,
                 None,
                 init_blocks=self.init_blocks,
